@@ -6,6 +6,6 @@ Comment=Configure DPI, lighting, profiles, and macros on Redragon/Holtek mice
 Exec=redragon-gui
 Icon=redragon-gui
 Terminal=false
-Categories=Settings;HardwareSettings;Utility;
+Categories=Settings;HardwareSettings;
 Keywords=mouse;gaming;dpi;led;macro;redragon;holtek;
 StartupNotify=true

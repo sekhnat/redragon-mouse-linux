@@ -1,0 +1,93 @@
+name: AppImage
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    paths:
+      - "src/**"
+      - "models/**"
+      - "assets/**"
+      - "packaging/**"
+      - "Cargo.*"
+      - ".github/workflows/appimage.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: appimage-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  appimage:
+    name: build AppImage (x86_64)
+    # glibc 2.35: the image runs on this and every newer distribution.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends librsvg2-bin desktop-file-utils appstream
+
+      - name: Validate desktop file and metainfo
+        run: |
+          desktop-file-validate assets/redragon-gui.desktop
+          appstreamcli validate --no-net assets/redragon-gui.metainfo.xml
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Work out the version
+        id: version
+        run: |
+          cargo_version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            tag_version="${GITHUB_REF#refs/tags/v}"
+            if [ "$tag_version" != "$cargo_version" ]; then
+              echo "tag v$tag_version does not match Cargo.toml version $cargo_version" >&2
+              exit 1
+            fi
+            echo "version=$cargo_version" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=$cargo_version-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package AppImage
+        run: packaging/build-appimage.sh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: redragon-gui-appimage-x86_64
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: publish release
+    needs: appimage
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: redragon-gui-appimage-x86_64
+          path: dist
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true

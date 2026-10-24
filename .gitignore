@@ -9,3 +9,7 @@
 
 # Vendored proprietary Windows package: reference material only, not redistributed
 /REDRAGON Gaming Mouse/
+
+# Packaging output
+/build/
+/dist/

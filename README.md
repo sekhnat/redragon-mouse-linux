@@ -117,7 +117,7 @@ reflash is the last resort.
 ## Requirements
 
 - Linux with `hidraw` (any current kernel) and `udev`.
-- A Rust toolchain, 1.82 or newer, to build.
+- A Rust toolchain, 1.95 or newer, to build (egui 0.37 requires it).
 - For the GUI: an X11 or Wayland session with an OpenGL-capable driver (the `glow` renderer).
 - Read/write access to the mouse's **vendor interface** (`/dev/hidrawN`), normally granted by a
   udev rule.
@@ -135,6 +135,31 @@ cargo build --release
 The result is a single binary at `target/release/redragon-gui`.
 
 ## Install
+
+### AppImage
+
+Every push to `main` builds an AppImage in CI (Actions → *AppImage* → artifacts) and every `v*` tag
+publishes one, with its `SHA256SUMS`, to the GitHub release:
+
+```sh
+chmod +x redragon-gui-*-x86_64.AppImage
+./redragon-gui-*-x86_64.AppImage --list-devices
+```
+
+The image bundles the binary and the model descriptors and uses your system's OpenGL, Wayland or
+X11 libraries. It cannot install the udev rule, so do that once (the rule is published next to the
+image and is also inside it: `./redragon-gui-*.AppImage --appimage-extract usr/share/redragon-gui`):
+
+```sh
+sudo install -Dm644 99-redragon-gui.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Build one locally with `packaging/build-appimage.sh` (needs `curl`, and `rsvg-convert` or
+ImageMagick); the result is `dist/redragon-gui-<version>-x86_64.AppImage`. Without FUSE, run it
+with `APPIMAGE_EXTRACT_AND_RUN=1`.
+
+### From a source build
 
 ```sh
 sudo install -Dm755 target/release/redragon-gui /usr/local/bin/redragon-gui
@@ -239,6 +264,8 @@ src/
   ui/          egui shell and one module per section
 models/        registry + per-model TOML descriptors
 assets/        udev rule, desktop entry, AppStream metadata, icon
+packaging/     AppImage build script (shared by CI and local builds)
+.github/       CI (fmt, clippy, tests, MSRV) and the AppImage workflow
 tests/         simulation, CLI contract, ignored hardware round-trip
 docs/          reverse-engineering report and hardware checkpoint
 openspec/      change proposal, specs, design and task record

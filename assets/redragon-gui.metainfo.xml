@@ -2,6 +2,8 @@
 <component type="desktop-application">
   <id>io.github.redragon_gui.redragon-gui</id>
   <name>Redragon Mouse</name>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT OR Apache-2.0</project_license>
   <summary>Configure Redragon/Holtek gaming mice on Linux</summary>
   <description>
     <p>
