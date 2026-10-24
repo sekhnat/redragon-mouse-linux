@@ -291,6 +291,28 @@ fn show_descriptor(models_dir: &std::path::Path, id: Option<&str>) -> Result<i32
     Ok(exit::OK)
 }
 
+/// Report an interface error: access failures get udev guidance and exit 3,
+/// model/hardware mismatches are plain errors with exit 1.
+fn interface_failure(
+    device: &device::HidrawDevice,
+    err: &device::InterfaceError,
+) -> Result<i32, String> {
+    if err.is_access() {
+        let access = device::inspect(&device.node).ok();
+        let guidance = device::guidance(device, access.as_ref(), &err.to_string());
+        println!("{}", guidance.detail);
+        println!();
+        println!("{}", guidance.instructions());
+        Ok(exit::ACCESS)
+    } else {
+        eprintln!(
+            "{} does not match the model descriptor: {err}",
+            device.node.display()
+        );
+        Ok(exit::ERROR)
+    }
+}
+
 fn report_descriptor(models_dir: &std::path::Path) -> Result<i32, String> {
     let registry = models::Registry::load(models_dir);
     let base = device::enumerate::default_base();
@@ -304,13 +326,20 @@ fn report_descriptor(models_dir: &std::path::Path) -> Result<i32, String> {
         match redragon_gui::transport::hidraw::HidrawTransport::report_descriptor(&det.device.node)
         {
             Ok(bytes) => bytes,
-            Err(err) => {
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
                 let access = device::inspect(&det.device.node).ok();
                 let guidance = device::guidance(&det.device, access.as_ref(), &err.to_string());
                 println!("{}", guidance.detail);
                 println!();
                 println!("{}", guidance.instructions());
                 return Ok(exit::ACCESS);
+            }
+            Err(err) => {
+                eprintln!(
+                    "cannot read the report descriptor from {}: {err}",
+                    det.device.node.display()
+                );
+                return Ok(exit::ERROR);
             }
         };
     println!("device: {}", det.device.node.display());
@@ -356,12 +385,7 @@ fn dump_raw(models_dir: &std::path::Path) -> Result<i32, String> {
     };
     let desc = &registry.descriptors[descriptor_index];
     if let Err(err) = device::validate_interface(&det.device, desc) {
-        let access = device::inspect(&det.device.node).ok();
-        let guidance = device::guidance(&det.device, access.as_ref(), &err.to_string());
-        println!("{}", guidance.detail);
-        println!();
-        println!("{}", guidance.instructions());
-        return Ok(exit::ACCESS);
+        return interface_failure(&det.device, &err);
     }
     let mut transport = redragon_gui::transport::hidraw::HidrawTransport::open(&det.device.node)
         .map_err(|err| err.to_string())?;
@@ -408,18 +432,27 @@ fn dump_state(models_dir: &std::path::Path, log_path: &Path) -> Result<i32, Stri
     };
     let desc = &registry.descriptors[device_index];
     if let Err(err) = device::validate_interface(&det.device, desc) {
-        let access = device::inspect(&det.device.node).ok();
-        let guidance = device::guidance(&det.device, access.as_ref(), &err.to_string());
-        println!("{}", guidance.detail);
-        println!();
-        println!("{}", guidance.instructions());
-        return Ok(exit::ACCESS);
+        return interface_failure(&det.device, &err);
     }
-    let mut transport = HidrawTransport::open(&det.device.node).map_err(|err| {
-        let access = device::inspect(&det.device.node).ok();
-        let guidance = device::guidance(&det.device, access.as_ref(), &err.to_string());
-        format!("{}\n\n{}", guidance.detail, guidance.instructions())
-    })?;
+    let mut transport = match HidrawTransport::open(&det.device.node) {
+        Ok(transport) => transport,
+        Err(err) => {
+            let access = device::inspect(&det.device.node).ok();
+            let guidance = device::guidance(&det.device, access.as_ref(), &err.to_string());
+            if matches!(
+                err,
+                redragon_gui::transport::TransportError::PermissionDenied { .. }
+                    | redragon_gui::transport::TransportError::Busy(_)
+                    | redragon_gui::transport::TransportError::NotFound(_)
+            ) {
+                println!("{}", guidance.detail);
+                println!();
+                println!("{}", guidance.instructions());
+                return Ok(exit::ACCESS);
+            }
+            return Err(format!("{}: {err}", guidance.detail));
+        }
+    };
     let state = match settings::read_state_consistent(&mut transport, desc, &Pacer::production()) {
         Ok(state) => state,
         Err(err) => {

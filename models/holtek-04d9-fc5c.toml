@@ -156,10 +156,14 @@ window = "led"
 write_addrs = [0x0449, 0x0451, 0x0459, 0x0461, 0x0469]
 color_offset = 0
 mode_offset = 3
-speed_offset = 5
+# Vendor writer layout: colour at +0..2, mode byte 0 at +3, speed at +4,
+# mode byte 1 at +5, brightness in a separate one-byte write at +6.
+speed_offset = 4
 brightness_offset = 6
 brightness_levels = 4
-speed_levels = 4
+# Observed speeds on this device are 2 and 4; the exact top level still needs a
+# capture, so 0..4 is offered.
+speed_levels = 5
 
 [[lighting.modes]]
 id = "static"

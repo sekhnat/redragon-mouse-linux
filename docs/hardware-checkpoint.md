@@ -109,9 +109,11 @@ guessed), polling shows the read rate, and the change set is empty until somethi
   preserves them byte-for-byte. No interpolation is performed.
 - **LED mode codes are unknown.** Profiles use mode bytes `0x01` and `0x02`, while the table only
   declares the report's `0x08` (static) and `0x00` (off). Brightness at base+6 reads `0x02`, and
-  the colour bytes are consistent with the visible red lighting. The offsets in the descriptor
-  (`mode +3`, `speed +5`, `brightness +6`) follow the read evidence and upstream reader offsets;
-  they are still unconfirmed for writes.
+  the colour bytes are consistent with the visible red lighting. The vendor writer puts colour at
+  `+0..2`, **mode byte 0 at `+3`, speed at `+4`, mode byte 1 at `+5`**, and brightness in a separate
+  one-byte write at `+6`. An earlier descriptor read speed at `+5` (which is mode byte 1); that has
+  been corrected. The observed speed values are 2 and 4, so the UI offers levels 0–4 pending a full
+  capture; writes to colour/mode/speed are still unconfirmed on hardware.
 - **Macro slots read back as zeros** via report 4 at `0x478 + 200·slot` with a 200-byte window.
   Report 5 answers the same request, so the report class for macros is not settled by reads alone.
 - **Profile pages use irregular addresses.** The vendor capture's read rows (and a live probe at

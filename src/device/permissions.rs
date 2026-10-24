@@ -102,8 +102,22 @@ impl AccessGuidance {
     /// Suggested commands for the user to run themselves.
     pub fn instructions(&self) -> String {
         format!(
-            "Install the rule and reload udev:\n  sudo tee /etc/udev/rules.d/{} >/dev/null <<'EOF'\n{}\nEOF\n  sudo udevadm control --reload-rules && sudo udevadm trigger\nThen reconnect the mouse.",
-            self.file, self.rule
+            r#"Install the rule and reload udev:
+  sudo tee /etc/udev/rules.d/{file} >/dev/null <<'EOF'
+{rule}
+EOF
+  sudo udevadm control --reload-rules && sudo udevadm trigger
+Then reconnect the mouse.
+
+If access is still denied after the reload (check `getfacl {node}`), add the group
+grant instead -- your account must be in that group:
+  sudo sed -i 's/TAG+="uaccess"/GROUP="users", TAG+="uaccess"/' /etc/udev/rules.d/{file}
+  sudo udevadm control --reload-rules && sudo udevadm trigger
+or grant a session-only ACL:
+  sudo setfacl -m u:$USER:rw {node}"#,
+            file = self.file,
+            rule = self.rule,
+            node = self.node.display()
         )
     }
 }
@@ -142,6 +156,14 @@ pub enum InterfaceError {
     },
     #[error("the device does not expose feature report {report_id} (the model declares {expected} bytes)")]
     MissingFeatureReport { report_id: u8, expected: usize },
+}
+
+impl InterfaceError {
+    /// True when the failure is about reaching the node (permissions, missing
+    /// node, bus error), not about the model not matching the hardware.
+    pub fn is_access(&self) -> bool {
+        matches!(self, InterfaceError::Open { .. })
+    }
 }
 
 /// Open the node, parse its report descriptor, and check it against the model.
@@ -251,6 +273,35 @@ mod tests {
                 .contains("udevadm control --reload-rules"),
             "{guidance:?}"
         );
+    }
+
+    #[test]
+    fn instructions_include_a_group_and_acl_fallback() {
+        let guidance = guidance(&device(), None, "permission denied");
+        let text = guidance.instructions();
+        assert!(text.contains("GROUP=\"users\""), "{text}");
+        assert!(text.contains("setfacl"), "{text}");
+        assert!(text.contains("getfacl"), "{text}");
+    }
+
+    #[test]
+    fn only_open_failures_count_as_access_problems() {
+        let open = InterfaceError::Open {
+            node: "/dev/hidraw3".into(),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        };
+        assert!(open.is_access());
+        let mismatch = InterfaceError::MissingCollection {
+            usage_page: 0xffa0,
+            usage: 1,
+        };
+        assert!(!mismatch.is_access());
+        let size = InterfaceError::SizeMismatch {
+            report_id: 4,
+            expected: 256,
+            actual: 1024,
+        };
+        assert!(!size.is_access());
     }
 
     #[test]
