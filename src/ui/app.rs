@@ -769,12 +769,18 @@ impl App {
             &mut state,
             &self.macro_names.names_for(&self.descriptor_id()),
         );
-        if let Some(descriptor) = &self.descriptor {
-            if state.active_profile < descriptor.profile_count() {
-                self.selected_profile = state.active_profile;
+        // Follow the mouse's active profile on the first read and after an
+        // activation only; a read after an apply must not pull the editor away
+        // from the stored profile that was being edited.
+        let first_read = self.baseline.is_none();
+        let expected = self.expect_profile.take();
+        if first_read || expected.is_some() {
+            if let Some(descriptor) = &self.descriptor {
+                if state.active_profile < descriptor.profile_count() {
+                    self.selected_profile = state.active_profile;
+                }
             }
         }
-        let expected = self.expect_profile.take();
         self.baseline = Some(state.clone());
 
         let reconnected = self.reconnect_pending.take();
@@ -877,6 +883,16 @@ impl App {
     pub(crate) fn draft_ops(&self) -> Vec<WriteOp> {
         match (&self.descriptor, &self.draft) {
             (Some(desc), Some(state)) => encode_ops(desc, state),
+            _ => Vec::new(),
+        }
+    }
+
+    /// One sentence per pending edit (see `ui::summary`).
+    pub(crate) fn change_lines(&self) -> Vec<String> {
+        match (&self.descriptor, &self.baseline, &self.draft) {
+            (Some(desc), Some(baseline), Some(draft)) => {
+                super::summary::describe_changes(desc, baseline, draft)
+            }
             _ => Vec::new(),
         }
     }
@@ -1439,7 +1455,10 @@ impl App {
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if self.is_dirty() {
-                        ui.colored_label(egui::Color32::from_rgb(220, 160, 40), "● pending edits");
+                        ui.colored_label(
+                            egui::Color32::from_rgb(220, 160, 40),
+                            "● pending edits (Ctrl+Enter to apply)",
+                        );
                     }
                     if self.busy {
                         ui.spinner();
@@ -1468,38 +1487,54 @@ impl App {
                 ui.label(egui::RichText::new("SECTIONS").small().weak());
                 for section in Section::ALL {
                     let supported = self.section_supported(section);
-                    ui.add_enabled_ui(supported, |ui| {
-                        if ui
-                            .selectable_label(self.section == section, section.label())
-                            .clicked()
-                        {
-                            self.section = section;
-                        }
-                    });
+                    let response = ui
+                        .add_enabled_ui(supported, |ui| {
+                            ui.selectable_label(self.section == section, section.label())
+                        })
+                        .inner;
+                    if response.clicked() {
+                        self.section = section;
+                    }
+                    if !supported {
+                        response.on_disabled_hover_text(unsupported_reason(section));
+                    }
                 }
                 ui.separator();
                 if let Some(desc) = &self.descriptor {
                     ui.label(egui::RichText::new("PROFILE").small().weak());
                     egui::ComboBox::from_id_salt("nav-profile")
                         .width(160.0)
-                        .selected_text(format!("Profile {}", self.selected_profile + 1))
+                        .selected_text(profile_label(
+                            self.selected_profile,
+                            self.draft.as_ref().map(|state| state.active_profile),
+                        ))
                         .show_ui(ui, |ui| {
                             for profile in desc.profile_indices() {
-                                let label = format!("Profile {}", profile + 1);
-                                if ui
-                                    .selectable_value(&mut self.selected_profile, profile, label)
-                                    .clicked()
-                                {
-                                    self.section = Section::Pointer;
-                                }
+                                let label = profile_label(
+                                    profile,
+                                    self.draft.as_ref().map(|state| state.active_profile),
+                                );
+                                ui.selectable_value(&mut self.selected_profile, profile, label);
                             }
                         });
                     if let Some(state) = &self.draft {
-                        ui.small(if state.active_profile == self.selected_profile {
-                            "this profile is active on the mouse"
+                        if state.active_profile == self.selected_profile {
+                            ui.small("in use on the mouse");
                         } else {
-                            "editing a stored profile"
-                        });
+                            ui.small("stored, not in use");
+                            let enabled = !self.busy && !self.is_dirty();
+                            let slot = self.selected_profile;
+                            let response = ui
+                                .add_enabled_ui(enabled, |ui| ui.button("Switch mouse to this"))
+                                .inner;
+                            if response.clicked() {
+                                self.perform(PendingAction::ActivateProfile(slot));
+                            }
+                            if !enabled {
+                                response
+                                    .on_disabled_hover_text("Apply or revert pending edits first.");
+                            }
+                        }
                     }
                 }
                 ui.separator();
@@ -1598,6 +1633,7 @@ impl App {
                 let mut apply = false;
                 let mut cancel = false;
                 let needs_ack = self.needs_unverified_ack();
+                let lines = self.change_lines();
                 let desc_note = self
                     .descriptor
                     .as_ref()
@@ -1606,23 +1642,33 @@ impl App {
                 egui::Modal::new(modal_id).show(ctx, |ui| {
                     ui.set_max_width(620.0);
                     ui.heading("Apply these changes?");
-                    ui.label(format!("{} register(s) will be written.", changes.len()));
-                    egui::ScrollArea::vertical().max_height(260.0).show(ui, |ui| {
-                        for change in &changes {
-                            ui.horizontal(|ui| {
-                                ui.label(&change.label);
-                                if let Some(before) = &change.before {
-                                    ui.weak(format!(
-                                        "[{}] → [{}]",
-                                        diff::describe_payload(before),
-                                        diff::describe_payload(&change.after)
-                                    ));
-                                } else {
-                                    ui.weak(format!("→ [{}]", diff::describe_payload(&change.after)));
+                    for line in &lines {
+                        ui.label(format!("•  {line}"));
+                    }
+                    ui.add_space(4.0);
+                    egui::CollapsingHeader::new(format!("Register details ({})", changes.len()))
+                        .default_open(lines.is_empty())
+                        .show(ui, |ui| {
+                            egui::ScrollArea::vertical().max_height(220.0).show(ui, |ui| {
+                                for change in &changes {
+                                    ui.horizontal(|ui| {
+                                        ui.label(&change.label);
+                                        if let Some(before) = &change.before {
+                                            ui.weak(format!(
+                                                "[{}] → [{}]",
+                                                diff::describe_payload(before),
+                                                diff::describe_payload(&change.after)
+                                            ));
+                                        } else {
+                                            ui.weak(format!(
+                                                "→ [{}]",
+                                                diff::describe_payload(&change.after)
+                                            ));
+                                        }
+                                    });
                                 }
                             });
-                        }
-                    });
+                        });
                     if let Some((provenance, model)) = &desc_note {
                         ui.add_space(6.0);
                         ui.colored_label(
@@ -1757,6 +1803,25 @@ impl App {
     }
 }
 
+/// "Profile 2 (in use)" for the profile the mouse is using.
+fn profile_label(profile: u8, active: Option<u8>) -> String {
+    if active == Some(profile) {
+        format!("Profile {} (in use)", profile + 1)
+    } else {
+        format!("Profile {}", profile + 1)
+    }
+}
+
+fn unsupported_reason(section: Section) -> &'static str {
+    match section {
+        Section::Buttons => "Button remapping is not available for this mouse yet.",
+        Section::Macros => "Macros are not available for this mouse yet.",
+        Section::Pointer => "This mouse declares no pointer settings.",
+        Section::Lighting => "This mouse declares no lighting settings.",
+        _ => "Not available.",
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
@@ -1768,6 +1833,11 @@ impl eframe::App for App {
         self.poll_hotplug(&ctx);
         self.poll_worker();
         self.handle_close_request(&ctx);
+        let apply_shortcut =
+            ctx.input(|input| input.modifiers.command && input.key_pressed(egui::Key::Enter));
+        if apply_shortcut && self.dialog.is_none() && self.apply_gate().is_none() {
+            self.begin_apply_dialog();
+        }
         self.draw_status(ui);
         self.draw_nav(ui);
         self.draw_section(ui);
@@ -2000,5 +2070,51 @@ mod tests {
             });
             output.drop_without_applying_deltas();
         }
+    }
+
+    #[test]
+    fn a_read_after_an_apply_keeps_the_profile_being_edited() {
+        let mut app = app_with_fixture();
+        app.selected_profile = 3;
+        let state = app.baseline.clone().expect("baseline");
+        app.install_read(state);
+        assert_eq!(
+            app.selected_profile, 3,
+            "the editor must not be pulled away"
+        );
+    }
+
+    #[test]
+    fn the_first_read_selects_the_active_profile() {
+        let mut app = app_with_fixture();
+        app.baseline = None;
+        app.draft = None;
+        let mut state = crate::settings::seed_state(app.descriptor.as_ref().unwrap());
+        state.active_profile = 2;
+        app.install_read(state);
+        assert_eq!(app.selected_profile, 2);
+    }
+
+    #[test]
+    fn activating_a_profile_moves_the_editor_to_it() {
+        let mut app = app_with_fixture();
+        let mut state = app.baseline.clone().expect("baseline");
+        state.active_profile = 4;
+        app.expect_profile = Some(4);
+        app.install_read(state);
+        assert_eq!(app.selected_profile, 4);
+    }
+
+    #[test]
+    fn pending_edits_are_listed_in_plain_language() {
+        let mut app = app_with_fixture();
+        assert!(app.change_lines().is_empty());
+        app.draft.as_mut().unwrap().profiles[0].polling_hz = Some(1000);
+        let lines = app.change_lines();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].starts_with("Profile 1 · Polling rate"),
+            "{lines:?}"
+        );
     }
 }

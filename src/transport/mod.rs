@@ -95,6 +95,10 @@ pub trait Transport: Send {
 
 /// Inter-frame pacing. Production values come from the reverse-engineering
 /// report: 10 ms between frames, 100 ms after the scroll-speed block.
+///
+/// `block_delay` applies to *writes* on the 64-byte report only; read requests
+/// always use `frame_delay`, because the 100 ms settle time belongs to the
+/// scroll-speed block write and made every profile-page read ten times slower.
 #[derive(Clone, Copy, Debug)]
 pub struct Pacer {
     pub frame_delay: Duration,
@@ -161,7 +165,10 @@ pub fn read_window<T: Transport + ?Sized>(
         }));
     }
     let request = Frame::read_request(total, read_cmd, addr, len as u8, report_id)?;
-    send_frame(transport, &request, pacer)?;
+    transport.set_feature(&request.bytes)?;
+    if !pacer.frame_delay.is_zero() {
+        std::thread::sleep(pacer.frame_delay);
+    }
     let response = transport.get_feature(report_id, total)?;
     let needed = PAYLOAD_OFFSET + len as usize;
     if response.len() < needed {

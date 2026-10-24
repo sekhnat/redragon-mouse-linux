@@ -9,5 +9,6 @@ pub mod lighting;
 pub mod macros;
 pub mod pointer;
 pub mod profiles;
+pub mod summary;
 
 pub use app::{run, RunOptions};

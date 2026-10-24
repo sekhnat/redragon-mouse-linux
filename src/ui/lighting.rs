@@ -3,6 +3,23 @@
 use eframe::egui;
 
 use super::app::App;
+use crate::models::descriptor::LightingSpec;
+use crate::settings::state::ProfileLighting;
+
+/// Quick colour choices shown under the picker.
+const PRESETS: [([u8; 3], &str); 9] = [
+    ([255, 0, 0], "Red"),
+    ([255, 128, 0], "Orange"),
+    ([255, 220, 0], "Yellow"),
+    ([0, 255, 0], "Green"),
+    ([0, 255, 220], "Cyan"),
+    ([0, 80, 255], "Blue"),
+    ([150, 0, 255], "Purple"),
+    ([255, 0, 160], "Pink"),
+    ([255, 255, 255], "White"),
+];
+
+const EFFECT_COLUMNS: usize = 4;
 
 impl App {
     pub(crate) fn draw_lighting(&mut self, ui: &mut egui::Ui) {
@@ -21,6 +38,11 @@ impl App {
             return;
         };
         let profile_index = self.selected_profile;
+        let active = self
+            .draft
+            .as_ref()
+            .map(|state| state.active_profile == profile_index)
+            .unwrap_or(false);
         let Some(state) = self.draft.as_mut() else {
             ui.label("Waiting for the device to be read…");
             return;
@@ -38,109 +60,60 @@ impl App {
             return;
         };
 
-        ui.label(egui::RichText::new("Effect").strong());
-        let current_mode = if lighting.mode.is_empty() {
-            format!("Unrecognised code {:#06x}", lighting.mode_code)
+        // The mouse shows the lighting of the active profile only.
+        if active {
+            ui.label(format!(
+                "Profile {} is active: applied changes show on the mouse straight away.",
+                profile_index + 1
+            ));
         } else {
-            spec.mode(&lighting.mode)
-                .map(|mode| mode.label.clone())
-                .unwrap_or_else(|| lighting.mode.clone())
-        };
-        let mut selected_mode = lighting.mode.clone();
-        egui::ComboBox::from_id_salt("led-mode")
-            .selected_text(current_mode)
-            .show_ui(ui, |ui| {
-                for mode in &spec.modes {
-                    ui.selectable_value(&mut selected_mode, mode.id.clone(), &mode.label);
-                }
-            });
-        if selected_mode != lighting.mode {
-            lighting.set_mode(&spec, &selected_mode);
+            ui.weak(format!(
+                "Profile {} is stored, not active: its lighting shows once you activate it.",
+                profile_index + 1
+            ));
         }
-        let mode = spec.mode(&lighting.mode).cloned();
-        let uses_color = mode.as_ref().map(|mode| mode.uses_color).unwrap_or(false);
-        let uses_speed = mode.as_ref().map(|mode| mode.uses_speed).unwrap_or(false);
-
         ui.add_space(8.0);
-        ui.label(egui::RichText::new("Colour").strong());
-        ui.add_enabled_ui(uses_color, |ui| {
-            ui.horizontal(|ui| {
-                ui.color_edit_button_srgb(&mut lighting.color);
-                let mut hex = format!(
-                    "#{:02x}{:02x}{:02x}",
-                    lighting.color[0], lighting.color[1], lighting.color[2]
-                );
+
+        effect_picker(ui, &spec, lighting);
+        let mode = spec.mode(&lighting.mode).cloned();
+        let uses_color = mode.as_ref().map(|m| m.uses_color).unwrap_or(false);
+        let uses_speed = mode.as_ref().map(|m| m.uses_speed).unwrap_or(false);
+
+        if uses_color {
+            ui.add_space(10.0);
+            colour_picker(ui, lighting);
+        }
+
+        ui.add_space(10.0);
+        ui.label(egui::RichText::new("Brightness").strong());
+        let top = spec.brightness_levels.saturating_sub(1);
+        ui.horizontal(|ui| {
+            for level in 0..=top {
                 if ui
-                    .add(egui::TextEdit::singleline(&mut hex).desired_width(90.0))
+                    .selectable_label(lighting.brightness == level, format!("{level}"))
+                    .clicked()
+                {
+                    lighting.brightness = level;
+                }
+            }
+            ui.weak(format!("0 – {top}"));
+        });
+
+        if uses_speed {
+            ui.add_space(10.0);
+            ui.label(egui::RichText::new("Speed").strong());
+            let steps = spec.speed_steps() as u32;
+            let mut level = spec.speed_level(lighting.speed) as u32;
+            ui.horizontal(|ui| {
+                ui.weak("slower");
+                if ui
+                    .add(egui::Slider::new(&mut level, 1..=steps).show_value(false))
                     .changed()
                 {
-                    if let Some(color) = parse_hex(&hex) {
-                        lighting.color = color;
-                    }
+                    lighting.speed = spec.speed_raw(level as u8);
                 }
-                ui.label("RGB");
+                ui.weak("faster");
             });
-            let (mut hue, mut saturation, mut value) = rgb_to_hsv(lighting.color);
-            let mut changed = false;
-            changed |= ui
-                .add(egui::Slider::new(&mut hue, 0.0..=360.0).text("Hue"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(&mut saturation, 0.0..=1.0).text("Saturation"))
-                .changed();
-            changed |= ui
-                .add(egui::Slider::new(&mut value, 0.0..=1.0).text("Value"))
-                .changed();
-            if changed {
-                lighting.color = hsv_to_rgb(hue, saturation, value);
-            }
-            ui.horizontal(|ui| {
-                for (index, channel) in ["R", "G", "B"].iter().enumerate() {
-                    let mut component = lighting.color[index] as u32;
-                    if ui
-                        .add(egui::Slider::new(&mut component, 0..=255).text(*channel))
-                        .changed()
-                    {
-                        lighting.color[index] = component as u8;
-                    }
-                }
-            });
-        });
-        if !uses_color {
-            ui.small(
-                "The selected effect does not use a colour; colour registers are left untouched.",
-            );
-        }
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            let mut brightness = lighting.brightness as u32;
-            let max = spec.brightness_levels.saturating_sub(1) as u32;
-            if ui
-                .add(egui::Slider::new(&mut brightness, 0..=max).text("Brightness"))
-                .changed()
-            {
-                lighting.brightness = brightness as u8;
-            }
-        });
-        ui.add_enabled_ui(uses_speed, |ui| {
-            let max = spec.speed_levels.saturating_sub(1) as u32;
-            let raw = (lighting.speed as u32).min(max);
-            // Show "higher is faster" even when the register counts the other way.
-            let mut speed = if spec.speed_inverted { max - raw } else { raw };
-            if ui
-                .add(egui::Slider::new(&mut speed, 0..=max).text("Effect speed"))
-                .changed()
-            {
-                lighting.speed = if spec.speed_inverted {
-                    max - speed
-                } else {
-                    speed
-                } as u8;
-            }
-        });
-        if !uses_speed {
-            ui.small("This effect has no adjustable speed on this model.");
         }
 
         if !spec.zones.is_empty() {
@@ -167,45 +140,132 @@ impl App {
                 });
         }
 
-        ui.add_space(10.0);
+        ui.add_space(12.0);
         ui.separator();
-        ui.label(egui::RichText::new("On the mouse").strong());
         match &baseline_lighting {
+            Some(baseline) if baseline != lighting => {
+                ui.colored_label(
+                    egui::Color32::from_rgb(220, 160, 40),
+                    "Pending: nothing is written until you apply.",
+                );
+                ui.weak(format!("On the mouse now: {}", summary(&spec, baseline)));
+            }
             Some(baseline) => {
-                let mode_label = if baseline.mode.is_empty() {
-                    spec.mode_by_code(baseline.mode_code)
-                        .map(|mode| mode.label.clone())
-                        .unwrap_or_else(|| format!("code {:#06x}", baseline.mode_code))
-                } else {
-                    spec.mode(&baseline.mode)
-                        .map(|mode| mode.label.clone())
-                        .unwrap_or_else(|| baseline.mode.clone())
-                };
-                ui.label(format!(
-                    "{} · colour #{:02x}{:02x}{:02x} · speed {} · brightness {}",
-                    mode_label,
-                    baseline.color[0],
-                    baseline.color[1],
-                    baseline.color[2],
-                    baseline.speed,
-                    baseline.brightness
-                ));
-                if baseline.mode != lighting.mode
-                    || baseline.color != lighting.color
-                    || baseline.speed != lighting.speed
-                    || baseline.brightness != lighting.brightness
-                {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(220, 160, 40),
-                        "The values above are pending; the preview is not the device's state.",
-                    );
-                }
+                ui.weak(format!("On the mouse: {}", summary(&spec, baseline)));
             }
             None => {
                 ui.small("No baseline read for this profile.");
             }
         }
     }
+}
+
+fn effect_picker(ui: &mut egui::Ui, spec: &LightingSpec, lighting: &mut ProfileLighting) {
+    ui.label(egui::RichText::new("Effect").strong());
+    if lighting.mode.is_empty() {
+        ui.colored_label(
+            egui::Color32::from_rgb(220, 160, 40),
+            format!(
+                "The mouse reports an effect this model does not list (code {:#06x}); choose one \
+                 below to replace it.",
+                lighting.mode_code
+            ),
+        );
+    }
+    let mut chosen: Option<String> = None;
+    egui::Grid::new("effect-grid")
+        .spacing([6.0, 6.0])
+        .show(ui, |ui| {
+            for (index, mode) in spec.modes.iter().enumerate() {
+                let selected = lighting.mode == mode.id;
+                let button = egui::Button::selectable(selected, &mode.label)
+                    .min_size(egui::vec2(120.0, 28.0));
+                if ui.add(button).clicked() && !selected {
+                    chosen = Some(mode.id.clone());
+                }
+                if (index + 1) % EFFECT_COLUMNS == 0 {
+                    ui.end_row();
+                }
+            }
+        });
+    if let Some(id) = chosen {
+        lighting.set_mode(spec, &id);
+    }
+}
+
+fn colour_picker(ui: &mut egui::Ui, lighting: &mut ProfileLighting) {
+    ui.label(egui::RichText::new("Colour").strong());
+    ui.horizontal(|ui| {
+        ui.color_edit_button_srgb(&mut lighting.color);
+        let mut hex = format!(
+            "#{:02x}{:02x}{:02x}",
+            lighting.color[0], lighting.color[1], lighting.color[2]
+        );
+        if ui
+            .add(egui::TextEdit::singleline(&mut hex).desired_width(80.0))
+            .changed()
+        {
+            if let Some(color) = parse_hex(&hex) {
+                lighting.color = color;
+            }
+        }
+        for (color, name) in PRESETS {
+            let swatch = egui::Button::new("")
+                .fill(egui::Color32::from_rgb(color[0], color[1], color[2]))
+                .min_size(egui::vec2(22.0, 22.0));
+            if ui.add(swatch).on_hover_text(name).clicked() {
+                lighting.color = color;
+            }
+        }
+    });
+    egui::CollapsingHeader::new("Fine-tune colour")
+        .default_open(false)
+        .show(ui, |ui| {
+            let (mut hue, mut saturation, mut value) = rgb_to_hsv(lighting.color);
+            let mut changed = false;
+            changed |= ui
+                .add(egui::Slider::new(&mut hue, 0.0..=360.0).text("Hue"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut saturation, 0.0..=1.0).text("Saturation"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut value, 0.0..=1.0).text("Value"))
+                .changed();
+            if changed {
+                lighting.color = hsv_to_rgb(hue, saturation, value);
+            }
+            for (index, channel) in ["R", "G", "B"].iter().enumerate() {
+                let mut component = lighting.color[index] as u32;
+                if ui
+                    .add(egui::Slider::new(&mut component, 0..=255).text(*channel))
+                    .changed()
+                {
+                    lighting.color[index] = component as u8;
+                }
+            }
+        });
+}
+
+fn summary(spec: &LightingSpec, lighting: &ProfileLighting) -> String {
+    let label = spec
+        .mode(&lighting.mode)
+        .or_else(|| spec.mode_by_code(lighting.mode_code))
+        .map(|mode| mode.label.clone())
+        .unwrap_or_else(|| format!("code {:#06x}", lighting.mode_code));
+    let uses_color = spec
+        .mode(&lighting.mode)
+        .map(|mode| mode.uses_color)
+        .unwrap_or(true);
+    let mut parts = vec![label];
+    if uses_color {
+        parts.push(format!(
+            "#{:02x}{:02x}{:02x}",
+            lighting.color[0], lighting.color[1], lighting.color[2]
+        ));
+    }
+    parts.push(format!("brightness {}", lighting.brightness));
+    parts.join(" · ")
 }
 
 fn parse_hex(text: &str) -> Option<[u8; 3]> {

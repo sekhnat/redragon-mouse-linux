@@ -23,25 +23,24 @@ impl App {
             return;
         };
 
+        let active = state.active_profile == profile_index;
+        ui.weak(if active {
+            format!("Profile {} is active on the mouse.", profile_index + 1)
+        } else {
+            format!(
+                "Profile {} is stored, not active: its settings apply once you activate it.",
+                profile_index + 1
+            )
+        });
+        ui.add_space(6.0);
+
         if let Some(spec) = &desc.dpi {
             ui.label(egui::RichText::new("DPI stages").strong());
-            ui.small(format!(
-                "Profile {} · {} stage(s) · {} values in this model's table",
-                profile_index + 1,
-                spec.stage_count,
-                desc.tables.dpi_codes.len()
-            ));
-            if !spec.per_axis {
-                ui.small(
-                    "This model stores a single sensitivity value per stage; X and Y stay linked.",
-                );
-            }
-            let values: Vec<u16> = desc
-                .tables
-                .dpi_codes
-                .iter()
-                .map(|entry| entry.dpi)
-                .collect();
+            ui.small(
+                "The DPI button on the mouse cycles through the enabled stages; the marked stage \
+                 is the one in use.",
+            );
+            let values = desc.dpi_values();
 
             let Some(dpi) = profile.dpi.as_mut() else {
                 ui.label("No DPI data was read.");
@@ -55,15 +54,16 @@ impl App {
             let mut set_link: Option<(usize, bool)> = None;
 
             egui::Grid::new("dpi-grid")
-                .num_columns(6)
-                .spacing([12.0, 6.0])
+                .num_columns(if spec.per_axis { 5 } else { 4 })
+                .spacing([12.0, 8.0])
                 .show(ui, |ui| {
                     ui.label(egui::RichText::new("Stage").strong());
                     ui.label(egui::RichText::new("On").strong());
                     ui.label(egui::RichText::new("DPI").strong());
-                    ui.label(egui::RichText::new("Link X/Y").strong());
-                    ui.label(egui::RichText::new("Active").strong());
-                    ui.label("");
+                    if spec.per_axis {
+                        ui.label(egui::RichText::new("Link X/Y").strong());
+                    }
+                    ui.label(egui::RichText::new("In use").strong());
                     ui.end_row();
 
                     for (index, stage) in dpi.stages.iter().enumerate() {
@@ -72,45 +72,25 @@ impl App {
                         if ui.checkbox(&mut enabled, "").changed() {
                             toggle = Some((index, enabled));
                         }
-                        let current = if stage.x == 0 {
-                            format!("unknown code {:#06x}", stage.raw)
-                        } else {
-                            format!("{}", stage.x)
-                        };
-                        egui::ComboBox::from_id_salt(("dpi-value", index))
-                            .selected_text(current)
-                            .show_ui(ui, |ui| {
-                                egui::ScrollArea::vertical()
-                                    .max_height(320.0)
-                                    .show(ui, |ui| {
-                                        for value in &values {
-                                            if ui
-                                                .selectable_label(
-                                                    stage.x == *value,
-                                                    format!("{value}"),
-                                                )
-                                                .clicked()
-                                            {
-                                                set_value = Some((index, *value));
-                                            }
-                                        }
-                                    });
-                            });
+                        ui.horizontal(|ui| {
+                            if let Some(value) = dpi_slider(ui, &values, stage.x, index) {
+                                set_value = Some((index, value));
+                            }
+                            if stage.x == 0 {
+                                ui.colored_label(
+                                    egui::Color32::from_rgb(220, 160, 40),
+                                    format!("code {:#06x} is not in the table", stage.raw),
+                                );
+                            }
+                        });
                         if spec.per_axis {
                             let mut linked = dpi.linked.get(index).copied().unwrap_or(true);
                             if ui.checkbox(&mut linked, "").changed() {
                                 set_link = Some((index, linked));
                             }
-                        } else {
-                            ui.weak("linked");
                         }
                         if ui.radio(dpi.active == index as u8, "").clicked() {
                             new_active = Some(index as u8);
-                        }
-                        if stage.x == 0 {
-                            ui.weak("not in this model's table");
-                        } else {
-                            ui.weak("");
                         }
                         ui.end_row();
                     }
@@ -160,27 +140,23 @@ impl App {
         }
 
         if let Some(spec) = &desc.polling {
-            ui.add_space(10.0);
+            ui.add_space(12.0);
             ui.label(egui::RichText::new("Polling rate").strong());
-            let current = profile.polling_hz;
-            let mut selected = current;
-            egui::ComboBox::from_id_salt("polling")
-                .selected_text(match current {
-                    Some(hz) => format!("{hz} Hz"),
-                    None => "not read".into(),
-                })
-                .show_ui(ui, |ui| {
-                    for code in &spec.codes {
-                        ui.selectable_value(
-                            &mut selected,
-                            Some(code.hz),
-                            format!("{} Hz", code.hz),
-                        );
+            ui.horizontal(|ui| {
+                for code in &spec.codes {
+                    let selected = profile.polling_hz == Some(code.hz);
+                    if ui
+                        .selectable_label(selected, format!("{} Hz", code.hz))
+                        .clicked()
+                    {
+                        profile.polling_hz = Some(code.hz);
                     }
-                });
-            if selected != current {
-                profile.polling_hz = selected;
-            }
+                }
+                if profile.polling_hz.is_none() {
+                    ui.weak("not read");
+                }
+            });
+            ui.small("Higher rates are smoother but use more CPU; 1000 Hz suits most games.");
         }
 
         if let Some(spec) = &desc.device {
@@ -269,6 +245,36 @@ impl App {
         ui.separator();
         ui.small("Values are read from the mouse. Unchanged registers are never rewritten.");
     }
+}
+
+/// A slider over the model's DPI table (index, not value, so the uneven step
+/// above 16000 DPI still moves one entry at a time). Returns the new value when
+/// the person changed it.
+fn dpi_slider(ui: &mut egui::Ui, values: &[u16], current: u16, id: usize) -> Option<u16> {
+    if values.is_empty() {
+        return None;
+    }
+    let last = values.len() - 1;
+    let mut position = values.iter().position(|v| *v == current).unwrap_or(0);
+    let table = values.to_vec();
+    let parse_table = values.to_vec();
+    let slider = egui::Slider::new(&mut position, 0..=last)
+        .show_value(true)
+        .custom_formatter(move |n, _| format!("{} DPI", table[(n as usize).min(last)]))
+        .custom_parser(move |text| {
+            let wanted: f64 = text
+                .trim()
+                .trim_end_matches(|c: char| !c.is_ascii_digit())
+                .parse()
+                .ok()?;
+            parse_table
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, v)| ((**v as f64) - wanted).abs() as i64)
+                .map(|(i, _)| i as f64)
+        });
+    let response = ui.push_id(("dpi-slider", id), |ui| ui.add(slider)).inner;
+    response.changed().then(|| values[position])
 }
 
 fn nearest_enabled(dpi: &ProfileDpi, disabled: usize) -> u8 {

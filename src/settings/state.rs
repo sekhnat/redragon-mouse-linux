@@ -1283,7 +1283,7 @@ pub fn seed_image(desc: &Descriptor) -> ReadImage {
             };
             let active_len = dpi.active_len.max(1) as usize;
             put(
-                dpi.write_report,
+                page.report,
                 dpi.active_addr_at(page.addr),
                 &vec![0u8; active_len],
             );
@@ -1308,11 +1308,7 @@ pub fn seed_image(desc: &Descriptor) -> ReadImage {
                         dpi.stage_len,
                     )
                 };
-                put(
-                    dpi.write_report,
-                    dpi.stage_addr_at(page.addr, stage),
-                    &payload,
-                );
+                put(page.report, dpi.stage_addr_at(page.addr, stage), &payload);
             }
         }
         if let Some(polling) = &desc.polling {

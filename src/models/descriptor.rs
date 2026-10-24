@@ -292,6 +292,37 @@ impl LightingSpec {
         .unwrap_or(0)
     }
 
+    /// Positions on the speed control; 1 is the slowest. An inverted register
+    /// has one position fewer because value 0 means "no speed" (the vendor
+    /// stores 0 for effects that have none).
+    pub fn speed_steps(&self) -> u8 {
+        if self.speed_inverted {
+            self.speed_levels.saturating_sub(1).max(1)
+        } else {
+            self.speed_levels.max(1)
+        }
+    }
+
+    /// Speed-control position (1 = slowest) for a raw register value.
+    pub fn speed_level(&self, raw: u8) -> u8 {
+        let steps = self.speed_steps();
+        if self.speed_inverted {
+            self.speed_levels.saturating_sub(raw).clamp(1, steps)
+        } else {
+            raw.saturating_add(1).min(steps)
+        }
+    }
+
+    /// Raw register value for a speed-control position (1 = slowest).
+    pub fn speed_raw(&self, level: u8) -> u8 {
+        let level = level.clamp(1, self.speed_steps());
+        if self.speed_inverted {
+            self.speed_levels - level
+        } else {
+            level - 1
+        }
+    }
+
     /// Split a mode code into the bytes stored at `mode_offset`/`mode2_offset`.
     pub fn mode_bytes(&self, code: u16) -> (u8, u8) {
         if self.mode2_offset.is_some() {
@@ -587,6 +618,14 @@ impl Descriptor {
             .get(id)
             .ok_or_else(|| format!("descriptor references unknown window `{id}`"))?;
         window.expand(id)
+    }
+
+    /// Every DPI value the model's table can express, ascending.
+    pub fn dpi_values(&self) -> Vec<u16> {
+        let mut values: Vec<u16> = self.tables.dpi_codes.iter().map(|e| e.dpi).collect();
+        values.sort_unstable();
+        values.dedup();
+        values
     }
 
     pub fn supports_lighting(&self) -> bool {

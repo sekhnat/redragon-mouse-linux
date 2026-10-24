@@ -128,7 +128,8 @@ window = "profile_page"
 active_window_offset = 0
 stage_window_offset = 2
 stage_count = 5
-write_report = 3
+# The vendor sends DPI writes as 16-byte frames; the register space is shared.
+write_report = 2
 stage_stride = 6
 stage_len = 5
 active_len = 1
