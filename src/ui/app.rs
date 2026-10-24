@@ -17,7 +17,7 @@ use crate::settings::{
 };
 use crate::transport::hidraw::HidrawTransport;
 use crate::transport::sim::SimTransport;
-use crate::transport::{Pacer, Transport, TransportError};
+use crate::transport::{Pacer, Transport};
 
 #[derive(Clone, Debug, Default)]
 pub struct RunOptions {
@@ -242,50 +242,7 @@ fn handle_request(
         }
         Request::Activate { profile } => {
             let transport = transport.as_mut().expect("open above");
-            let sizes = desc.frame_sizes();
-            let activated = match desc.commands.activate_addr {
-                Some(addr) => {
-                    let payload = [profile, 0];
-                    let frame = crate::transport::frames::Frame::write(
-                        sizes.for_report(2).unwrap_or(16),
-                        desc.commands.write,
-                        addr,
-                        desc.commands.activate_len,
-                        &payload,
-                    )
-                    .map_err(TransportError::from)
-                    .and_then(|frame| {
-                        crate::transport::send_frame(transport.as_mut(), &frame, pacer)
-                    });
-                    frame.and_then(|()| {
-                        crate::transport::commit_all(
-                            transport.as_mut(),
-                            &sizes,
-                            desc,
-                            &desc.commands.activate_frames,
-                            pacer,
-                        )
-                    })
-                }
-                None => crate::transport::begin_profile(
-                    transport.as_mut(),
-                    &sizes,
-                    desc.commands.begin_report,
-                    desc.commands.begin,
-                    profile,
-                    pacer,
-                )
-                .and_then(|()| {
-                    crate::transport::commit_all(
-                        transport.as_mut(),
-                        &sizes,
-                        desc,
-                        &desc.commands.commit_frames,
-                        pacer,
-                    )
-                }),
-            };
-            match activated {
+            match crate::settings::activate_profile(transport.as_mut(), desc, profile, pacer) {
                 Ok(()) => {
                     let result = read_state_consistent(transport.as_mut(), desc, pacer)
                         .map_err(|err| err.to_string());

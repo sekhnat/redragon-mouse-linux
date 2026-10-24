@@ -358,7 +358,7 @@ pub fn import_profile(
             if let Some(mode) = lighting.mode(raw) {
                 state.mode = mode.id.clone();
                 state.mode_code = mode.code;
-            } else if let Ok(code) = u8::from_str_radix(raw.trim_start_matches("0x"), 16) {
+            } else if let Ok(code) = u16::from_str_radix(raw.trim_start_matches("0x"), 16) {
                 state.mode.clear();
                 state.mode_code = code;
             } else {

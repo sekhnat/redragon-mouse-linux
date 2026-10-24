@@ -40,7 +40,7 @@ write = 0xf3
 read = 0xf2
 commit = 0xf1
 commit_report = 2
-commit_frames = [0x0001]
+commit_frames = [0x0201]
 
 [windows.page]
 report = 3

@@ -31,6 +31,8 @@ enum Command {
     ShowDescriptor(Option<String>),
     ReportDescriptor,
     DumpRaw,
+    /// Apply `key=value` edits to the connected mouse (see `settings::assign`).
+    Set(Vec<String>),
     Simulate(String),
     Help,
     Version,
@@ -71,6 +73,7 @@ fn dispatch() -> Result<i32, String> {
         Command::ReportDescriptor => report_descriptor(&models_dir),
         Command::DumpRaw => dump_raw(&models_dir),
         Command::DumpState => dump_state(&models_dir, log.path()),
+        Command::Set(items) => set_settings(&models_dir, &items),
         Command::Simulate(model) => ui::run(RunOptions {
             simulation: Some(model),
             models_dir: Some(models_dir),
@@ -99,6 +102,17 @@ fn parse_args(args: Vec<String>) -> Result<Options, String> {
             "--dump-state" => command = Command::DumpState,
             "--report-descriptor" => command = Command::ReportDescriptor,
             "--dump-raw" => command = Command::DumpRaw,
+            "--set" => {
+                let item = args
+                    .get(index + 1)
+                    .ok_or_else(|| "--set needs key=value".to_string())?
+                    .clone();
+                index += 1;
+                match &mut command {
+                    Command::Set(items) => items.push(item),
+                    other => *other = Command::Set(vec![item]),
+                }
+            }
             "--show-descriptor" => {
                 let id = args
                     .get(index + 1)
@@ -415,6 +429,90 @@ fn dump_raw(models_dir: &std::path::Path) -> Result<i32, String> {
     Ok(exit::OK)
 }
 
+fn set_settings(models_dir: &std::path::Path, items: &[String]) -> Result<i32, String> {
+    if std::env::var("REDRAGON_GUI_ALLOW_WRITE").as_deref() != Ok("1") {
+        return Err("refusing to write: set REDRAGON_GUI_ALLOW_WRITE=1 to confirm".into());
+    }
+    let registry = models::Registry::load(models_dir);
+    let base = device::enumerate::default_base();
+    let detected = device::scan_and_identify(&registry, &base)
+        .map_err(|err| format!("cannot scan {}: {err}", base.display()))?;
+    let Some(det) = detected.iter().find(|d| d.is_supported()) else {
+        println!("no supported device found");
+        return Ok(exit::NO_DEVICE);
+    };
+    let descriptor_index = match det.identification {
+        device::Identification::Supported {
+            descriptor_index, ..
+        } => descriptor_index,
+        _ => unreachable!(),
+    };
+    let desc = &registry.descriptors[descriptor_index];
+    if let Err(err) = device::validate_interface(&det.device, desc) {
+        return interface_failure(&det.device, &err);
+    }
+    let mut transport = HidrawTransport::open(&det.device.node).map_err(|err| err.to_string())?;
+    let pacer = Pacer::production();
+    let baseline = settings::read_state_consistent(&mut transport, desc, &pacer)
+        .map_err(|err| format!("cannot read a consistent state: {err}"))?;
+    let mut draft = baseline.draft();
+    let assigned = settings::assign::apply_assignments(desc, &mut draft, items)?;
+
+    let paths = Paths::from_env();
+    let ids = settings::DeviceIds {
+        vendor_id: det.device.vendor_id,
+        product_id: det.device.product_id,
+    };
+    let apply_settings = settings::ApplySettings {
+        pacer,
+        force_stale: false,
+        active_profile: baseline.active_profile,
+        label: format!("cli --set {}", items.join(" ")),
+    };
+    let mut code = exit::OK;
+    match settings::apply(
+        &mut transport,
+        desc,
+        &baseline,
+        &draft,
+        ids,
+        &paths,
+        &apply_settings,
+    ) {
+        Ok(report) => {
+            println!(
+                "applied {} register write(s), {} confirmed by read-back",
+                report.changed, report.confirmed
+            );
+            for mismatch in &report.mismatches {
+                println!("mismatch: {mismatch}");
+            }
+            for warning in &report.warnings {
+                println!("warning: {warning}");
+            }
+            if let Some(backup) = &report.backup {
+                println!("backup: {}", backup.display());
+            }
+            if !report.fully_confirmed() {
+                code = exit::ERROR;
+            }
+        }
+        Err(settings::ApplyError::NoChanges) => println!("no register differs from the device"),
+        Err(err) => return Err(format!("apply failed: {err}")),
+    }
+    if let Some(profile) = assigned.activate {
+        settings::activate_profile(&mut transport, desc, profile, &pacer)
+            .map_err(|err| format!("cannot activate profile {}: {err}", profile + 1))?;
+        let after = settings::read_state_consistent(&mut transport, desc, &pacer)
+            .map_err(|err| format!("cannot read back: {err}"))?;
+        println!("active profile is now {}", after.active_profile + 1);
+        if after.active_profile != profile {
+            code = exit::ERROR;
+        }
+    }
+    Ok(code)
+}
+
 fn dump_state(models_dir: &std::path::Path, log_path: &Path) -> Result<i32, String> {
     let registry = models::Registry::load(models_dir);
     let base = device::enumerate::default_base();
@@ -495,7 +593,7 @@ fn dump_state(models_dir: &std::path::Path, log_path: &Path) -> Result<i32, Stri
             println!(
                 "  lighting: {} rgb {:02x}{:02x}{:02x} speed {} brightness {}",
                 if lighting.mode.is_empty() {
-                    format!("code {:#04x}", lighting.mode_code)
+                    format!("code {:#06x}", lighting.mode_code)
                 } else {
                     lighting.mode.clone()
                 },
@@ -546,6 +644,10 @@ fn print_help() {
          \x20   --dump-state              Read the device's current settings and print them\n\
          \x20   --report-descriptor       Dump the interface report descriptor and parse it\n\
          \x20   --dump-raw                Print the raw register windows read from the device\n\
+         \x20   --set KEY=VALUE           Write settings to the mouse (repeatable); needs\n\
+         \x20                             REDRAGON_GUI_ALLOW_WRITE=1. Keys: led.P.mode|color|\n\
+         \x20                             speed|brightness, dpi.P.S, dpi.P.S.on, dpi.P.active,\n\
+         \x20                             poll.P, profile (P, S are 1-based)\n\
          \x20   --show-descriptor [ID]    Print a model descriptor (default: first loaded)\n\
          \x20   --simulate <MODEL>        Run the interface against a simulated device\n\
          \x20   --models-dir <PATH>       Load descriptors from PATH\n\

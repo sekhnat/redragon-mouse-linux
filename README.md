@@ -16,10 +16,12 @@ reads the current register state before showing anything editable, applies chang
 transaction with a backup and read-back verification, and reports exactly what the mouse did — or
 did not — accept.
 
-> **Project status: alpha.** The transport, the read path, and one write path (LED brightness) are
-> verified on a Redragon M721-Pro (`04d9:fc5c`). That model's descriptor is still marked
-> **unverified** because its DPI and LED-mode tables are incomplete; every write therefore requires
-> an explicit risk acknowledgement. Details: [`docs/hardware-checkpoint.md`](docs/hardware-checkpoint.md).
+> **Project status: alpha.** On a Redragon M721-Pro (`04d9:fc5c`) lighting (all eight effects,
+> colour, speed, brightness), DPI stages and the active stage, polling rate and profile switching are
+> verified on the real mouse by observing the effect, not only by read-back. Button remapping and
+> macros are not implemented yet. The model's descriptor stays marked **unverified** for that
+> reason, so every write requires an explicit risk acknowledgement. Details:
+> [`docs/hardware-checkpoint.md`](docs/hardware-checkpoint.md).
 
 ## Contents
 
@@ -57,7 +59,7 @@ kernel module, `libusb`, or root.
 - **Read-back-first configuration.** Nothing is shown as a device value unless it was read from the
   device in this session, twice, with matching results.
 - **Reviewed, verified writes.** A change is shown as a before/after register diff, backed up,
-  written with the vendor's begin/commit framing, and then read back. Mismatches are reported as
+  written inside a configuration session followed by the vendor's refresh frames, and then read back. Mismatches are reported as
   "not confirmed" and never presented as success.
 - **Automatic backup and restore.** Every apply stores the pre-change values as timestamped JSON;
   restore replays through the same validated path.
@@ -79,7 +81,7 @@ kernel module, `libusb`, or root.
 
 | Device | USB ID | State | Notes |
 |---|---|---|---|
-| Redragon M721-Pro "Lonewolf2" | `04d9:fc5c` | Read verified, brightness write verified, descriptor **unverified** | DPI and LED-mode tables incomplete; button keymaps and global pointer settings not declared |
+| Redragon M721-Pro "Lonewolf2" | `04d9:fc5c` | Lighting, DPI, polling and profile switching verified on hardware; descriptor **unverified** | Button keymaps, macros and global pointer settings not declared |
 | Other Redragon/Holtek models | — | Not supported yet | Add a descriptor after capturing the model (see [Model descriptors](#model-descriptors)) |
 
 The attached device was identified as an M721-Pro by its USB ID and the vendor data tree; the
@@ -100,8 +102,9 @@ tool is built around that risk:
    since the baseline, the apply is refused until you explicitly choose "write anyway".
 5. **Back up first.** A timestamped JSON backup of the pre-apply values is written before any
    frame is sent.
-6. **Write transactionally.** Per-profile begin/write/commit framing with the documented pacing;
-   a mid-transaction failure triggers a rollback of the registers already written.
+6. **Write transactionally.** One session (`F5 00` ... `F5 01`) per phase, the vendor's refresh
+   sequence after the writes, and the documented pacing; a mid-transaction failure triggers a
+   rollback of the registers already written. The closing frame is always sent.
 7. **Verify by read-back.** Every written register is read back and compared. The report names any
    register that was not confirmed.
 8. **Never escalate.** Access problems are explained; the tool does not run `sudo`, install files,
@@ -264,27 +267,30 @@ REDRAGON_GUI_ALLOW_WRITE=1 cargo test --test hardware -- --ignored --nocapture
 ```
 
 It changes one LED brightness value on a non-active profile, verifies it by read-back, restores the
-backup, and verifies the restore. It refuses to run without the environment variable.
+backup, and verifies the restore. Read-back only proves a register was stored; the firmware also
+needs the session and refresh frames, so check lighting, DPI and profile changes by eye (and polling
+by counting reports, as in the hardware checkpoint). It refuses to run without the environment variable.
 
 ## Known limitations
 
-- **DPI and LED-mode tables are incomplete for `04d9:fc5c`.** The device's current codes are shown
-  as unknown and preserved byte-for-byte; selecting a table value writes a code that has not been
-  confirmed on this PID. The LED mode encoding is two bytes and only partly modelled.
-- **Button remapping is unavailable on this model.** The documented keymap addresses collide with
-  the DPI pages, so no keymap registers are declared; the Buttons screen explains this.
+- **Button remapping is unavailable on this model.** The keymap lives at `0x82 + 4·slot` per
+  profile and the vendor's function codes are known (`81` left, `82` right, `83` middle, ...), but
+  the slot order and the keyboard/combo encodings are not decoded, so no keymap registers are
+  declared and the Buttons screen explains this.
 - **Global pointer settings are unavailable on this model** (angle snap, lift-off distance, scroll
   speed/page, acceleration, double-click), because their registers are not pinned.
 - **Burst fire is unavailable on this model** (no burst register is declared).
-- **Macro writing is unverified.** The record encoding is a documented hypothesis; only the
-  brightness write has been exercised on hardware.
+- **Macros are unavailable on this model.** The record encoding at `0x478 + 200·slot` is not
+  decoded, so the model declares no macro section rather than writing guessed bytes.
 - **`.prof` interoperability is approximate.** The tool round-trips its own exports and reads the
   documented field names, but vendor action codes and some fields differ.
 - **Other models need captures.** Adding one is data-only, but the descriptor must be written from
   evidence.
-- **The `04d9:fc5c` descriptor stays unverified**, so every write requires the risk
-  acknowledgement.
-- **Writes are GUI-only.** There is no headless `--set` command yet.
+- **The `04d9:fc5c` descriptor stays unverified** until buttons and macros are decoded, so every
+  write requires the risk acknowledgement in the GUI.
+- **Scripted writes** use `redragon-gui --set KEY=VALUE` (for example `--set led.1.mode=wave`,
+  `--set dpi.1.4=1600`, `--set poll.1=1000`, `--set profile=2`) and refuse to run without
+  `REDRAGON_GUI_ALLOW_WRITE=1`.
 - **Packaging and project metadata are unfinished** (no AUR/Flatpak/CI; the AppStream URL is a
   placeholder).
 - **egui's accessibility is weaker than GTK's.** Keyboard navigation and focus are implemented;

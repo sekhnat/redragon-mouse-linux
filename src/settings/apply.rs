@@ -6,7 +6,7 @@ use crate::models::Descriptor;
 use crate::paths::Paths;
 use crate::transport::frames::{Frame, FrameError};
 use crate::transport::{
-    begin_profile, commit_all, read_window, send_frame, Pacer, Transport, TransportError,
+    commit_all, read_window, send_frame, with_session, Pacer, Transport, TransportError,
 };
 
 use super::backup::{self, BackupFile};
@@ -24,6 +24,9 @@ pub struct ApplySettings {
     pub pacer: Pacer,
     /// Write even when the targeted registers changed since the baseline read.
     pub force_stale: bool,
+    /// Index of the profile the mouse is currently using. Informational: a
+    /// write session addresses every profile's registers directly, so it never
+    /// changes which profile is active.
     pub active_profile: u8,
     pub label: String,
 }
@@ -100,62 +103,40 @@ pub enum ApplyError {
 }
 
 /// Read the whole register image described by the model.
+///
+/// The reads sit inside one session; the closing `F5 01` is always sent, even
+/// when a read fails, so the mouse resumes reporting pointer input.
 pub fn read_image<T: Transport + ?Sized>(
     transport: &mut T,
     desc: &Descriptor,
     pacer: &Pacer,
 ) -> Result<ReadImage, ReadError> {
     let sizes = desc.frame_sizes();
-    begin_profile(
-        transport,
-        &sizes,
-        desc.commands.begin_report,
-        desc.commands.begin,
-        0,
-        pacer,
-    )?;
-    let mut image = ReadImage::default();
-    let mut read_result: Result<(), ReadError> = Ok(());
-    for instance in desc.window_instances().map_err(ReadError::Plan)? {
-        let bytes = match read_window(
-            transport,
-            &sizes,
-            desc.commands.read,
-            instance.report,
-            instance.addr,
-            instance.len,
-            pacer,
-        ) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                read_result = Err(ReadError::Transport(err));
-                break;
-            }
-        };
-        image.insert(
-            &instance.id,
-            instance.profile,
-            WindowData {
-                report: instance.report,
-                addr: instance.addr,
-                bytes,
-            },
-        );
-    }
-    // The vendor's read sequence ends by selecting profile 1's page; without
-    // it the mouse stays in its read/configuration state and stops reporting
-    // pointer input. Always send it, even if a read failed.
-    let exit_result = begin_profile(
-        transport,
-        &sizes,
-        desc.commands.begin_report,
-        desc.commands.begin,
-        1,
-        pacer,
-    )
-    .map_err(ReadError::Transport);
-    read_result?;
-    exit_result?;
+    let instances = desc.window_instances().map_err(ReadError::Plan)?;
+    let image = with_session(transport, desc, pacer, |t| {
+        let mut image = ReadImage::default();
+        for instance in &instances {
+            let bytes = read_window(
+                t,
+                &sizes,
+                desc.commands.read,
+                instance.report,
+                instance.addr,
+                instance.len,
+                pacer,
+            )?;
+            image.insert(
+                &instance.id,
+                instance.profile,
+                WindowData {
+                    report: instance.report,
+                    addr: instance.addr,
+                    bytes,
+                },
+            );
+        }
+        Ok(image)
+    })?;
     Ok(image)
 }
 
@@ -232,31 +213,7 @@ fn send_op<T: Transport + ?Sized>(
     send_frame(transport, &frame, pacer)
 }
 
-/// Write one profile's operations with begin/commit framing.
-fn write_group<T: Transport + ?Sized>(
-    transport: &mut T,
-    desc: &Descriptor,
-    ops: &[&WriteOp],
-    profile: u8,
-    pacer: &Pacer,
-    written: &mut Vec<WriteOp>,
-) -> Result<(), TransportError> {
-    let sizes = desc.frame_sizes();
-    begin_profile(
-        transport,
-        &sizes,
-        desc.commands.begin_report,
-        desc.commands.begin,
-        profile,
-        pacer,
-    )?;
-    for op in ops {
-        send_op(transport, desc, op, pacer)?;
-        written.push((*op).clone());
-    }
-    commit_all(transport, &sizes, desc, &desc.commands.commit_frames, pacer)
-}
-
+/// Replay baseline values for the registers already written (best effort).
 fn rollback<T: Transport + ?Sized>(
     transport: &mut T,
     desc: &Descriptor,
@@ -268,17 +225,26 @@ fn rollback<T: Transport + ?Sized>(
         attempted: written.len(),
         ..Default::default()
     };
-    for op in written.iter().rev() {
-        let Some(base) = baseline.iter().find(|base| base.id == op.id) else {
-            report
-                .failures
-                .push(format!("{}: no baseline value to restore", op.describe()));
-            continue;
-        };
-        match send_op(transport, desc, base, pacer) {
-            Ok(()) => report.restored += 1,
-            Err(err) => report.failures.push(format!("{}: {err}", op.describe())),
+    let sizes = desc.frame_sizes();
+    let outcome = with_session(transport, desc, pacer, |t| {
+        for op in written.iter().rev() {
+            let Some(base) = baseline.iter().find(|base| base.id == op.id) else {
+                report
+                    .failures
+                    .push(format!("{}: no baseline value to restore", op.describe()));
+                continue;
+            };
+            match send_op(t, desc, base, pacer) {
+                Ok(()) => report.restored += 1,
+                Err(err) => report.failures.push(format!("{}: {err}", op.describe())),
+            }
         }
+        commit_all(t, &sizes, desc, &desc.commands.commit_frames, pacer)?;
+        std::thread::sleep(pacer.block_delay);
+        Ok(())
+    });
+    if let Err(err) = outcome {
+        report.failures.push(format!("rollback session: {err}"));
     }
     report
 }
@@ -292,26 +258,32 @@ fn verify<T: Transport + ?Sized>(
     let sizes = desc.frame_sizes();
     let mut confirmed = 0usize;
     let mut mismatches = Vec::new();
-    for op in changed {
-        let read = read_window(
-            transport,
-            &sizes,
-            desc.commands.read,
-            op.report,
-            op.addr,
-            op.payload.len() as u16,
-            pacer,
-        );
-        match read {
-            Ok(actual) if actual == op.payload => confirmed += 1,
-            Ok(actual) => mismatches.push(format!(
-                "{}: wrote [{}] but read [{}]",
-                op.describe(),
-                payload_hex(&op.payload),
-                payload_hex(&actual)
-            )),
-            Err(err) => mismatches.push(format!("{}: read-back failed: {err}", op.describe())),
+    let outcome = with_session(transport, desc, pacer, |t| {
+        for op in changed {
+            let read = read_window(
+                t,
+                &sizes,
+                desc.commands.read,
+                op.report,
+                op.addr,
+                op.payload.len() as u16,
+                pacer,
+            );
+            match read {
+                Ok(actual) if actual == op.payload => confirmed += 1,
+                Ok(actual) => mismatches.push(format!(
+                    "{}: wrote [{}] but read [{}]",
+                    op.describe(),
+                    payload_hex(&op.payload),
+                    payload_hex(&actual)
+                )),
+                Err(err) => mismatches.push(format!("{}: read-back failed: {err}", op.describe())),
+            }
         }
+        Ok(())
+    });
+    if let Err(err) = outcome {
+        mismatches.push(format!("verification session: {err}"));
     }
     (confirmed, mismatches)
 }
@@ -338,32 +310,38 @@ pub fn apply_ops<T: Transport + ?Sized>(
     let sizes = desc.frame_sizes();
     let mut differences = Vec::new();
     let mut stale_check_errors = Vec::new();
-    for op in &changed {
-        let Some(expected) = baseline_ops
-            .iter()
-            .find(|base| base.id == op.id)
-            .map(|base| base.payload.clone())
-        else {
-            continue;
-        };
-        match read_window(
-            transport,
-            &sizes,
-            desc.commands.read,
-            op.report,
-            op.addr,
-            op.payload.len() as u16,
-            &settings.pacer,
-        ) {
-            Ok(actual) if actual != expected => differences.push(format!(
-                "{}: device holds [{}] but the baseline read was [{}]",
-                op.describe(),
-                payload_hex(&actual),
-                payload_hex(&expected)
-            )),
-            Ok(_) => {}
-            Err(err) => stale_check_errors.push(format!("{}: {err}", op.describe())),
+    let stale = with_session(transport, desc, &settings.pacer, |t| {
+        for op in &changed {
+            let Some(expected) = baseline_ops
+                .iter()
+                .find(|base| base.id == op.id)
+                .map(|base| base.payload.clone())
+            else {
+                continue;
+            };
+            match read_window(
+                t,
+                &sizes,
+                desc.commands.read,
+                op.report,
+                op.addr,
+                op.payload.len() as u16,
+                &settings.pacer,
+            ) {
+                Ok(actual) if actual != expected => differences.push(format!(
+                    "{}: device holds [{}] but the baseline read was [{}]",
+                    op.describe(),
+                    payload_hex(&actual),
+                    payload_hex(&expected)
+                )),
+                Ok(_) => {}
+                Err(err) => stale_check_errors.push(format!("{}: {err}", op.describe())),
+            }
         }
+        Ok(())
+    });
+    if let Err(err) = stale {
+        stale_check_errors.push(format!("stale-check session: {err}"));
     }
     if !differences.is_empty() && !settings.force_stale {
         return Err(ApplyError::Stale { differences });
@@ -381,50 +359,27 @@ pub fn apply_ops<T: Transport + ?Sized>(
     )
     .map_err(ApplyError::Backup)?;
 
-    // Write profile-scoped operations first, then device-level ones.
-    let mut profiles: Vec<u8> = changed.iter().filter_map(|op| op.profile).collect();
-    profiles.sort_unstable();
-    profiles.dedup();
-
+    // One session: every changed register (addresses are absolute, so profile
+    // order is irrelevant), then the vendor's refresh sequence that makes the
+    // firmware reload what was stored.
     let mut written: Vec<WriteOp> = Vec::new();
-    let mut failure: Option<TransportError> = None;
-    for profile in profiles {
-        let group: Vec<&WriteOp> = changed
-            .iter()
-            .filter(|op| op.profile == Some(profile))
-            .collect();
-        if group.is_empty() {
-            continue;
+    let write_result = with_session(transport, desc, &settings.pacer, |t| {
+        for op in &changed {
+            send_op(t, desc, op, &settings.pacer)?;
+            written.push(op.clone());
         }
-        if let Err(err) = write_group(
-            transport,
+        commit_all(
+            t,
+            &sizes,
             desc,
-            &group,
-            profile,
+            &desc.commands.commit_frames,
             &settings.pacer,
-            &mut written,
-        ) {
-            failure = Some(err);
-            break;
-        }
-    }
-    if failure.is_none() {
-        let group: Vec<&WriteOp> = changed.iter().filter(|op| op.profile.is_none()).collect();
-        if !group.is_empty() {
-            if let Err(err) = write_group(
-                transport,
-                desc,
-                &group,
-                settings.active_profile,
-                &settings.pacer,
-                &mut written,
-            ) {
-                failure = Some(err);
-            }
-        }
-    }
+        )?;
+        std::thread::sleep(settings.pacer.block_delay);
+        Ok(())
+    });
 
-    if let Some(source) = failure {
+    if let Err(source) = write_result {
         let report = rollback(transport, desc, &written, baseline_ops, &settings.pacer);
         return Err(ApplyError::Transport {
             source,
@@ -432,39 +387,7 @@ pub fn apply_ops<T: Transport + ?Sized>(
         });
     }
 
-    // Writing a stored profile can make it active. Switch back so editing a
-    // stored profile does not silently change which one the mouse uses.
-    let mut warnings = Vec::new();
-    let touched_other = written
-        .iter()
-        .filter_map(|op| op.profile)
-        .any(|profile| profile != settings.active_profile);
-    if touched_other {
-        let restored = begin_profile(
-            transport,
-            &sizes,
-            desc.commands.begin_report,
-            desc.commands.begin,
-            settings.active_profile,
-            &settings.pacer,
-        )
-        .and_then(|()| {
-            commit_all(
-                transport,
-                &sizes,
-                desc,
-                &desc.commands.commit_frames,
-                &settings.pacer,
-            )
-        });
-        if let Err(err) = restored {
-            warnings.push(format!(
-                "could not switch back to profile {} after writing another profile: {err}",
-                settings.active_profile + 1
-            ));
-        }
-    }
-
+    let warnings = Vec::new();
     let (confirmed, mismatches) = verify(transport, desc, &changed, &settings.pacer);
     tracing::info!(
         changed = changed.len(),
@@ -481,6 +404,52 @@ pub fn apply_ops<T: Transport + ?Sized>(
         backup: Some(backup_path),
         stale_check_errors,
         warnings,
+    })
+}
+
+/// Make `profile` (0-based) the profile the mouse uses: write the model's
+/// active-profile register inside a session, then send the activation refresh.
+pub fn activate_profile<T: Transport + ?Sized>(
+    transport: &mut T,
+    desc: &Descriptor,
+    profile: u8,
+    pacer: &Pacer,
+) -> Result<(), TransportError> {
+    let addr = desc
+        .commands
+        .activate_addr
+        .ok_or(TransportError::Unsupported(
+            "this model has no active-profile register",
+        ))?;
+    let sizes = desc.frame_sizes();
+    let total = sizes
+        .for_report(2)
+        .ok_or(TransportError::UnknownReport(2))?;
+    with_session(transport, desc, pacer, |t| {
+        let frame = Frame::write(
+            total,
+            desc.commands.write,
+            addr,
+            desc.commands.activate_len,
+            &[profile, 0],
+        )?;
+        send_frame(t, &frame, pacer)?;
+        commit_all(t, &sizes, desc, &desc.commands.activate_frames, pacer)?;
+        // The firmware does not always reload the lighting of the newly selected
+        // profile (switching to profile 1 often left the old effect running).
+        // Writing the profile's own record back and refreshing again does; the
+        // same bytes are rewritten, so nothing changes in the stored settings.
+        if let Some(lighting) = &desc.lighting {
+            if let Some(&record) = lighting.write_addrs.get(profile as usize) {
+                let len = lighting.record_len();
+                let bytes = read_window(t, &sizes, desc.commands.read, 2, record, len, pacer)?;
+                let frame = Frame::write(total, desc.commands.write, record, len as u8, &bytes)?;
+                send_frame(t, &frame, pacer)?;
+                commit_all(t, &sizes, desc, &desc.commands.activate_frames, pacer)?;
+            }
+        }
+        std::thread::sleep(pacer.block_delay);
+        Ok(())
     })
 }
 
@@ -593,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_apply_writes_only_the_changed_register() {
+    fn confirmed_apply_writes_only_the_changed_record() {
         let desc = desc();
         let (_tmp, paths) = paths();
         let mut sim = sim_with(&desc);
@@ -619,8 +588,13 @@ mod tests {
             .into_iter()
             .filter(|h| h.cmd == desc.commands.write)
             .collect();
-        assert_eq!(writes.len(), 1, "only one register should be written");
-        assert_eq!(writes[0].addr, 0x044F);
+        assert_eq!(writes.len(), 1, "only one record should be written");
+        assert_eq!(writes[0].addr, 0x0449, "the whole LED record is written");
+        assert_eq!(writes[0].len, 7);
+        // The vendor refresh sequence follows the writes and the session closes.
+        assert_eq!(sim.refresh_flags, vec![0x04, 0x01, 0x02, 0x08, 0x10]);
+        assert_eq!(sim.lost_writes, 0, "writes must be refreshed");
+        assert!(!sim.in_session(), "the session must be closed");
     }
 
     #[test]
@@ -675,7 +649,7 @@ mod tests {
         .expect_err("stale");
         match err {
             ApplyError::Stale { differences } => {
-                assert!(differences[0].contains("LED brightness"), "{differences:?}");
+                assert!(differences[0].contains("LED settings"), "{differences:?}");
             }
             other => panic!("unexpected error: {other}"),
         }
@@ -691,7 +665,9 @@ mod tests {
         let desc = desc();
         let (_tmp, paths) = paths();
         let mut sim = sim_with(&desc);
-        sim.fail_write_at = Some(4); // begin, 2 writes, then fail
+        // stale-check session: open, 2 read requests, close; write session:
+        // open, first write, then the second write (frame 6) fails.
+        sim.fail_write_at = Some(6);
         let baseline = seed_state(&desc);
         let mut draft = baseline.clone();
         draft.profiles[0].lighting.as_mut().unwrap().brightness = 0;
@@ -714,8 +690,14 @@ mod tests {
             }
             other => panic!("unexpected error: {other}"),
         }
-        // The first register written must be back at its baseline value.
-        assert_eq!(sim.bytes_at(0x044F, 1), vec![3]);
+        // The first register written (polling) must be back at its baseline.
+        let polling_addr = desc.polling.as_ref().unwrap().write_addrs[0];
+        let baseline_code = sim_with(&desc).bytes_at(polling_addr, 1);
+        assert_eq!(sim.bytes_at(polling_addr, 1), baseline_code);
+        assert!(
+            !sim.in_session(),
+            "the session must be closed after a failure"
+        );
     }
 
     #[test]
@@ -765,7 +747,8 @@ mod tests {
         let (_tmp, paths) = paths();
         let mut sim = sim_with(&desc);
         let baseline = seed_state(&desc);
-        let other_before = sim.bytes_at(0x0042 + 0x00c0 * 2, 32);
+        let other_before = sim.bytes_at(0x01b2, 32);
+        let other_led_before = sim.bytes_at(0x0459, 7);
         let mut draft = baseline.clone();
         draft.profiles[1].lighting.as_mut().unwrap().brightness = 1;
         apply(
@@ -778,12 +761,13 @@ mod tests {
             &settings(),
         )
         .expect("apply");
-        let other_after = sim.bytes_at(0x0042 + 0x00c0 * 2, 32);
+        let other_after = sim.bytes_at(0x01b2, 32);
         assert_eq!(other_before, other_after, "profile 3 must not change");
+        assert_eq!(other_led_before, sim.bytes_at(0x0459, 7));
         assert_eq!(
-            sim.profile(),
-            baseline.active_profile,
-            "the previously active profile must be restored"
+            sim.bytes_at(0x002c, 1),
+            vec![baseline.active_profile],
+            "writing another profile must not change the active one"
         );
     }
 

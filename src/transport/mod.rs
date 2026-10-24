@@ -64,11 +64,15 @@ pub enum TransportError {
     #[error("feature report {0} is not declared by the model")]
     UnknownReport(u8),
     #[error("{0}")]
+    Unsupported(&'static str),
+    #[error("{0}")]
     Frame(#[from] FrameError),
     #[error("simulated transport failure at frame {0}")]
     Simulated(usize),
     #[error("simulated read failure at read {0}")]
     SimulatedRead(usize),
+    #[error("simulated protocol violation: {0}")]
+    Protocol(String),
 }
 
 /// The single seam through which every device operation goes.
@@ -169,57 +173,74 @@ pub fn read_window<T: Transport + ?Sized>(
     Ok(frames::response_payload(&response, len as usize).to_vec())
 }
 
-/// Read the whole register space described by a set of window instances.
-///
-/// The first frame selects the profile page with `0xF5` when `begin` is given,
-/// mirroring the sequence the vendor application uses before reading.
-pub fn begin_profile<T: Transport + ?Sized>(
+/// Send one `0xF5` session frame: `closing == false` opens, `true` closes.
+pub fn session_frame<T: Transport + ?Sized>(
     transport: &mut T,
     sizes: &FrameSizes,
     report_id: u8,
     begin_cmd: u8,
-    profile: u8,
+    closing: bool,
     pacer: &Pacer,
 ) -> Result<(), TransportError> {
     let total = sizes
         .for_report(report_id)
         .ok_or(TransportError::UnknownReport(report_id))?;
-    let frame = Frame::begin(total, report_id, begin_cmd, profile)?;
+    let frame = Frame::begin(total, report_id, begin_cmd, closing as u8)?;
     send_frame(transport, &frame, pacer)
 }
 
-/// Send the commit frame that finalises a write batch.
+/// Run `body` inside a configuration session (`F5 00` ... `F5 01`).
+///
+/// The closing frame is always sent, even when `body` fails: without it the
+/// mouse stays in its configuration state and stops reporting pointer input.
+/// `body`'s error wins over a close error.
+pub fn with_session<T: Transport + ?Sized, R>(
+    transport: &mut T,
+    desc: &crate::models::Descriptor,
+    pacer: &Pacer,
+    body: impl FnOnce(&mut T) -> Result<R, TransportError>,
+) -> Result<R, TransportError> {
+    let sizes = desc.frame_sizes();
+    let report = desc.commands.begin_report;
+    let cmd = desc.commands.begin;
+    session_frame(transport, &sizes, report, cmd, false, pacer)?;
+    let result = body(transport);
+    let closed = session_frame(transport, &sizes, report, cmd, true, pacer);
+    let value = result?;
+    closed?;
+    Ok(value)
+}
+
+/// Send one refresh frame (see [`Frame::commit`] for the word layout).
 pub fn commit<T: Transport + ?Sized>(
     transport: &mut T,
     sizes: &FrameSizes,
     commit_cmd: u8,
-    addr: u16,
-    len: u8,
+    word: u16,
     report_id: u8,
     pacer: &Pacer,
 ) -> Result<(), TransportError> {
     let total = sizes
         .for_report(report_id)
         .ok_or(TransportError::UnknownReport(report_id))?;
-    let frame = Frame::commit(total, commit_cmd, addr, len, report_id)?;
+    let frame = Frame::commit(total, commit_cmd, word, report_id)?;
     send_frame(transport, &frame, pacer)
 }
 
-/// Send every commit frame of a descriptor's sequence, in order.
+/// Send every refresh word of a descriptor's sequence, in order.
 pub fn commit_all<T: Transport + ?Sized>(
     transport: &mut T,
     sizes: &FrameSizes,
     desc: &crate::models::Descriptor,
-    addresses: &[u16],
+    words: &[u16],
     pacer: &Pacer,
 ) -> Result<(), TransportError> {
-    for addr in addresses {
+    for word in words {
         commit(
             transport,
             sizes,
             desc.commands.commit,
-            *addr,
-            0,
+            *word,
             desc.commands.commit_report,
             pacer,
         )?;

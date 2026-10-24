@@ -80,14 +80,21 @@ impl App {
                         egui::ComboBox::from_id_salt(("dpi-value", index))
                             .selected_text(current)
                             .show_ui(ui, |ui| {
-                                for value in &values {
-                                    if ui
-                                        .selectable_label(stage.x == *value, format!("{value}"))
-                                        .clicked()
-                                    {
-                                        set_value = Some((index, *value));
-                                    }
-                                }
+                                egui::ScrollArea::vertical()
+                                    .max_height(320.0)
+                                    .show(ui, |ui| {
+                                        for value in &values {
+                                            if ui
+                                                .selectable_label(
+                                                    stage.x == *value,
+                                                    format!("{value}"),
+                                                )
+                                                .clicked()
+                                            {
+                                                set_value = Some((index, *value));
+                                            }
+                                        }
+                                    });
                             });
                         if spec.per_axis {
                             let mut linked = dpi.linked.get(index).copied().unwrap_or(true);

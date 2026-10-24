@@ -46,10 +46,14 @@ pub struct FrameSpec {
     pub len: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Profiles {
     pub count: u8,
+    /// Read window whose first byte is the index of the profile the mouse is
+    /// using. When absent the index is taken from the first DPI page.
+    #[serde(default)]
+    pub active_window: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -81,8 +85,9 @@ pub struct Commands {
     pub read: u8,
     pub commit: u8,
     pub commit_report: u8,
-    /// Address words for the commit/apply frames (the low byte carries the
-    /// vendor's commit mask, e.g. `0x0202` and `0x0208`).
+    /// Refresh words sent after a write batch. Each word is
+    /// `(mask << 8) | flag` and becomes the frame `{id, F1, mask, flag}`: the
+    /// vendor sends mask `0x02` with flags `04 01 02 08 10` after an apply.
     pub commit_frames: Vec<u16>,
     /// Register that selects the active profile (e.g. `0x002C`). When absent,
     /// activation falls back to a begin frame followed by `commit_frames`.
@@ -256,21 +261,51 @@ pub struct LightingSpec {
     pub write_addrs: Vec<u16>,
     pub color_offset: u16,
     pub mode_offset: u16,
+    /// Second mode byte. When set, a mode's `code` is `(mode << 8) | mode2`.
+    #[serde(default)]
+    pub mode2_offset: Option<u16>,
     pub speed_offset: u16,
     pub brightness_offset: u16,
     pub brightness_levels: u8,
+    /// Number of speed steps; `speed` is the raw register value `0..speed_levels`.
     pub speed_levels: u8,
+    /// True when a larger register value means a slower effect.
+    #[serde(default)]
+    pub speed_inverted: bool,
     pub modes: Vec<ModeCode>,
     #[serde(default)]
     pub zones: Vec<ZoneSpec>,
 }
 
 impl LightingSpec {
+    /// Bytes covered by one profile's lighting record.
+    pub fn record_len(&self) -> u16 {
+        [
+            self.color_offset + 3,
+            self.mode_offset + 1,
+            self.mode2_offset.map(|o| o + 1).unwrap_or(0),
+            self.speed_offset + 1,
+            self.brightness_offset + 1,
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or(0)
+    }
+
+    /// Split a mode code into the bytes stored at `mode_offset`/`mode2_offset`.
+    pub fn mode_bytes(&self, code: u16) -> (u8, u8) {
+        if self.mode2_offset.is_some() {
+            ((code >> 8) as u8, code as u8)
+        } else {
+            (code as u8, 0)
+        }
+    }
+
     pub fn mode(&self, id: &str) -> Option<&ModeCode> {
         self.modes.iter().find(|m| m.id == id)
     }
 
-    pub fn mode_by_code(&self, code: u8) -> Option<&ModeCode> {
+    pub fn mode_by_code(&self, code: u16) -> Option<&ModeCode> {
         self.modes.iter().find(|m| m.code == code)
     }
 }
@@ -280,7 +315,8 @@ impl LightingSpec {
 pub struct ModeCode {
     pub id: String,
     pub label: String,
-    pub code: u8,
+    /// Mode byte, or `(mode << 8) | mode2` when the model has a second mode byte.
+    pub code: u16,
     #[serde(default)]
     pub uses_color: bool,
     #[serde(default)]
@@ -681,34 +717,12 @@ impl Descriptor {
         }
         if let Some(lighting) = &self.lighting {
             for (profile, addr) in lighting.write_addrs.iter().enumerate() {
-                let profile = profile as u8;
                 out.push(Footprint {
-                    section: "lighting.color",
-                    profile: Some(profile),
+                    section: "lighting",
+                    profile: Some(profile as u8),
                     report: 2,
-                    addr: addr.wrapping_add(lighting.color_offset),
-                    len: 3,
-                });
-                out.push(Footprint {
-                    section: "lighting.mode",
-                    profile: Some(profile),
-                    report: 2,
-                    addr: addr.wrapping_add(lighting.mode_offset),
-                    len: 1,
-                });
-                out.push(Footprint {
-                    section: "lighting.speed",
-                    profile: Some(profile),
-                    report: 2,
-                    addr: addr.wrapping_add(lighting.speed_offset),
-                    len: 1,
-                });
-                out.push(Footprint {
-                    section: "lighting.brightness",
-                    profile: Some(profile),
-                    report: 2,
-                    addr: addr.wrapping_add(lighting.brightness_offset),
-                    len: 1,
+                    addr: *addr,
+                    len: lighting.record_len(),
                 });
             }
             for zone in &lighting.zones {

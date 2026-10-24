@@ -40,7 +40,7 @@ impl App {
 
         ui.label(egui::RichText::new("Effect").strong());
         let current_mode = if lighting.mode.is_empty() {
-            format!("Unrecognised code {:#04x}", lighting.mode_code)
+            format!("Unrecognised code {:#06x}", lighting.mode_code)
         } else {
             spec.mode(&lighting.mode)
                 .map(|mode| mode.label.clone())
@@ -55,10 +55,7 @@ impl App {
                 }
             });
         if selected_mode != lighting.mode {
-            lighting.mode = selected_mode;
-            if let Some(mode) = spec.mode(&lighting.mode) {
-                lighting.mode_code = mode.code;
-            }
+            lighting.set_mode(&spec, &selected_mode);
         }
         let mode = spec.mode(&lighting.mode).cloned();
         let uses_color = mode.as_ref().map(|mode| mode.uses_color).unwrap_or(false);
@@ -127,13 +124,19 @@ impl App {
             }
         });
         ui.add_enabled_ui(uses_speed, |ui| {
-            let mut speed = lighting.speed as u32;
             let max = spec.speed_levels.saturating_sub(1) as u32;
+            let raw = (lighting.speed as u32).min(max);
+            // Show "higher is faster" even when the register counts the other way.
+            let mut speed = if spec.speed_inverted { max - raw } else { raw };
             if ui
                 .add(egui::Slider::new(&mut speed, 0..=max).text("Effect speed"))
                 .changed()
             {
-                lighting.speed = speed as u8;
+                lighting.speed = if spec.speed_inverted {
+                    max - speed
+                } else {
+                    speed
+                } as u8;
             }
         });
         if !uses_speed {
@@ -172,7 +175,7 @@ impl App {
                 let mode_label = if baseline.mode.is_empty() {
                     spec.mode_by_code(baseline.mode_code)
                         .map(|mode| mode.label.clone())
-                        .unwrap_or_else(|| format!("code {:#04x}", baseline.mode_code))
+                        .unwrap_or_else(|| format!("code {:#06x}", baseline.mode_code))
                 } else {
                     spec.mode(&baseline.mode)
                         .map(|mode| mode.label.clone())

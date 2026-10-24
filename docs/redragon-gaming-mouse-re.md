@@ -158,6 +158,14 @@ len:  payload length marker (0/1/2/4/6/… varies per frame class)
 
 **Read path.** This app build reads feature reports only for macro verification; the GUI never reads general settings back (state is kept in the INI files). mouse_m908 demonstrates that these mice also support **GET_REPORT** (`bmRequestType 0xA1, bRequest 0x01, wValue 0x03<id>, wIndex 0x0002`) to read any register back — the basis of its `read_settings()`.
 
+> **Corrections from the hardware checkpoint (see `docs/hardware-checkpoint.md`).** Verified on the
+> attached M721-Pro, these supersede parts of this section: `F5 00`/`F5 01` open and close a
+> configuration session (the argument is not a profile); `F1` frames are `{02 F1 02 <flag>}` with the
+> flag in byte 3, sent for flags `04 01 02 08 10`; the vendor collection is `0xFFA0` and report 4 is
+> 256 bytes (the 1024-byte report is ID 5); the active profile is register `0x2C`; polling codes are
+> `8/4/2/1` for 125/250/500/1000 Hz; and the LED record is `R G B mode speed mode2 brightness`
+> at `0x449 + 8p`. The mouse_m908 values quoted below belong to a different sensor generation.
+
 ### 5.3 Register map (as used by this protocol family)
 
 Reconstructed from mouse_m908's `include/m721/data.cpp` register captures (authoritative for `0x04d9:0xfc5c`, the attached mouse's PID) and consistent with the app's frame writers:

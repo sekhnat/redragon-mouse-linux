@@ -90,13 +90,33 @@ pub struct ProfileDpi {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProfileLighting {
     pub mode: String,
-    /// Mode byte as read, used when `mode` is empty (unrecognised code).
-    pub mode_code: u8,
+    /// Mode code as read (`(mode << 8) | mode2` on models with two mode bytes),
+    /// used when `mode` is empty (unrecognised code).
+    pub mode_code: u16,
     pub color: [u8; 3],
     pub speed: u8,
     pub brightness: u8,
     /// Per-zone colours in descriptor order; empty when the model has no zones.
     pub zone_colors: Vec<[u8; 3]>,
+}
+
+impl ProfileLighting {
+    /// Select an effect by id, keeping `speed` consistent with what the effect
+    /// can use: effects without a speed store 0 (as the vendor does) and an
+    /// effect that gains one starts from the middle of the range.
+    pub fn set_mode(&mut self, spec: &crate::models::descriptor::LightingSpec, id: &str) -> bool {
+        let Some(mode) = spec.mode(id) else {
+            return false;
+        };
+        self.mode = mode.id.clone();
+        self.mode_code = mode.code;
+        if !mode.uses_speed {
+            self.speed = 0;
+        } else if self.speed == 0 {
+            self.speed = spec.speed_levels / 2;
+        }
+        true
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -245,11 +265,14 @@ pub fn decode(desc: &Descriptor, image: &ReadImage) -> Result<DeviceState, Decod
     let profiles = desc.profile_count();
     let mut out = Vec::with_capacity(profiles as usize);
 
-    // Active profile lives at the start of profile 0's page.
-    let active_profile = match &desc.dpi {
-        Some(dpi) => read_bytes(image, &dpi.window, 0, dpi.active_window_offset as usize, 1)?[0]
-            .min(profiles.saturating_sub(1)),
-        None => 0,
+    // The model's active-profile register, when it has one.
+    let active_profile = match (&desc.profiles.active_window, &desc.dpi) {
+        (Some(window), _) => read_bytes(image, window, 0, 0, 1)?[0].min(profiles.saturating_sub(1)),
+        (None, Some(dpi)) => {
+            read_bytes(image, &dpi.window, 0, dpi.active_window_offset as usize, 1)?[0]
+                .min(profiles.saturating_sub(1))
+        }
+        (None, None) => 0,
     };
 
     for profile in 0..profiles {
@@ -304,13 +327,21 @@ pub fn decode(desc: &Descriptor, image: &ReadImage) -> Result<DeviceState, Decod
                 lighting.color_offset as usize,
                 3,
             )?;
-            let mode_code = read_bytes(
+            let mode_byte = read_bytes(
                 image,
                 &lighting.window,
                 profile,
                 lighting.mode_offset as usize,
                 1,
             )?[0];
+            let mode_code = match lighting.mode2_offset {
+                Some(offset) => {
+                    let second =
+                        read_bytes(image, &lighting.window, profile, offset as usize, 1)?[0];
+                    ((mode_byte as u16) << 8) | second as u16
+                }
+                None => mode_byte as u16,
+            };
             let speed = read_bytes(
                 image,
                 &lighting.window,
@@ -616,6 +647,14 @@ impl WriteOp {
     }
 }
 
+/// Pad `bytes` with zeros up to `len` (never truncates).
+fn padded(mut bytes: Vec<u8>, len: u8) -> Vec<u8> {
+    if bytes.len() < len as usize {
+        bytes.resize(len as usize, 0);
+    }
+    bytes
+}
+
 pub fn encode_ops(desc: &Descriptor, state: &DeviceState) -> Vec<WriteOp> {
     let mut ops = Vec::new();
     if let Some(dpi) = &desc.dpi {
@@ -635,7 +674,7 @@ pub fn encode_ops(desc: &Descriptor, state: &DeviceState) -> Vec<WriteOp> {
                     profile: Some(profile),
                     report: dpi.write_report,
                     addr: dpi.active_addr_at(page.addr),
-                    payload: vec![value.active, 0],
+                    payload: padded(vec![value.active], dpi.active_len),
                 });
             }
             for (stage, stage_value) in value.stages.iter().enumerate() {
@@ -658,12 +697,14 @@ pub fn encode_ops(desc: &Descriptor, state: &DeviceState) -> Vec<WriteOp> {
                         (raw_y >> 8) as u8,
                     ]
                 } else {
-                    vec![
-                        stage_value.enabled as u8,
-                        (raw_x & 0xff) as u8,
-                        (raw_x >> 8) as u8,
-                        0,
-                    ]
+                    padded(
+                        vec![
+                            stage_value.enabled as u8,
+                            (raw_x & 0xff) as u8,
+                            (raw_x >> 8) as u8,
+                        ],
+                        dpi.stage_len,
+                    )
                 };
                 ops.push(WriteOp {
                     id: format!("dpi.stage:{profile}:{stage}"),
@@ -713,15 +754,18 @@ pub fn encode_ops(desc: &Descriptor, state: &DeviceState) -> Vec<WriteOp> {
                 continue;
             };
             let profile = profile as u8;
+            // The vendor writes the whole record (colour, both mode bytes,
+            // speed, brightness) in one frame, so do the same. Bytes the model
+            // does not name keep the value that was read.
+            let mut record = state
+                .image
+                .get(&lighting.window, profile)
+                .map(|bytes| bytes.to_vec())
+                .unwrap_or_default();
+            record.resize(lighting.record_len() as usize, 0);
             if lighting.zones.is_empty() {
-                ops.push(WriteOp {
-                    id: format!("lighting.color:{profile}"),
-                    label: "LED colour".into(),
-                    profile: Some(profile),
-                    report: 2,
-                    addr: addr.wrapping_add(lighting.color_offset),
-                    payload: value.color.to_vec(),
-                });
+                let at = lighting.color_offset as usize;
+                record[at..at + 3].copy_from_slice(&value.color);
             }
             let mode_code = if value.mode.is_empty() {
                 value.mode_code
@@ -731,29 +775,20 @@ pub fn encode_ops(desc: &Descriptor, state: &DeviceState) -> Vec<WriteOp> {
                     .map(|m| m.code)
                     .unwrap_or(value.mode_code)
             };
+            let (first, second) = lighting.mode_bytes(mode_code);
+            record[lighting.mode_offset as usize] = first;
+            if let Some(offset) = lighting.mode2_offset {
+                record[offset as usize] = second;
+            }
+            record[lighting.speed_offset as usize] = value.speed;
+            record[lighting.brightness_offset as usize] = value.brightness;
             ops.push(WriteOp {
-                id: format!("lighting.mode:{profile}"),
-                label: "LED mode".into(),
+                id: format!("lighting:{profile}"),
+                label: "LED settings".into(),
                 profile: Some(profile),
                 report: 2,
-                addr: addr.wrapping_add(lighting.mode_offset),
-                payload: vec![mode_code],
-            });
-            ops.push(WriteOp {
-                id: format!("lighting.speed:{profile}"),
-                label: "LED effect speed".into(),
-                profile: Some(profile),
-                report: 2,
-                addr: addr.wrapping_add(lighting.speed_offset),
-                payload: vec![value.speed],
-            });
-            ops.push(WriteOp {
-                id: format!("lighting.brightness:{profile}"),
-                label: "LED brightness".into(),
-                profile: Some(profile),
-                report: 2,
-                addr: addr.wrapping_add(lighting.brightness_offset),
-                payload: vec![value.brightness],
+                addr: *addr,
+                payload: record,
             });
         }
         for (zone_index, zone) in lighting.zones.iter().enumerate() {
@@ -1246,7 +1281,7 @@ pub fn seed_image(desc: &Descriptor) -> ReadImage {
             let Some(page) = dpi_pages.iter().find(|page| page.profile == profile) else {
                 continue;
             };
-            let active_len = dpi.active_len.max(2) as usize;
+            let active_len = dpi.active_len.max(1) as usize;
             put(
                 dpi.write_report,
                 dpi.active_addr_at(page.addr),
@@ -1268,7 +1303,10 @@ pub fn seed_image(desc: &Descriptor) -> ReadImage {
                         (code >> 8) as u8,
                     ]
                 } else {
-                    vec![1, (code & 0xff) as u8, (code >> 8) as u8, 0]
+                    padded(
+                        vec![1, (code & 0xff) as u8, (code >> 8) as u8],
+                        dpi.stage_len,
+                    )
                 };
                 put(
                     dpi.write_report,
@@ -1297,7 +1335,11 @@ pub fn seed_image(desc: &Descriptor) -> ReadImage {
                     &[0xFF, 0xFF, 0xFF],
                 );
                 let mode = lighting.modes.first().map(|m| m.code).unwrap_or(0);
-                put(2, addr.wrapping_add(lighting.mode_offset), &[mode]);
+                let (first, second) = lighting.mode_bytes(mode);
+                put(2, addr.wrapping_add(lighting.mode_offset), &[first]);
+                if let Some(offset) = lighting.mode2_offset {
+                    put(2, addr.wrapping_add(offset), &[second]);
+                }
                 put(2, addr.wrapping_add(lighting.speed_offset), &[1]);
                 put(
                     2,
@@ -1410,7 +1452,7 @@ mod tests {
         assert_eq!(dpi.stages.len(), 5);
         assert_eq!(state.profiles[0].polling_hz, Some(500));
         let lighting = state.profiles[0].lighting.as_ref().expect("lighting");
-        assert_eq!(lighting.mode, "static");
+        assert_eq!(lighting.mode, "breathing");
         assert_eq!(lighting.color, [0xFF, 0xFF, 0xFF]);
     }
 

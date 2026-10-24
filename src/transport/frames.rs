@@ -10,9 +10,15 @@
 //!      +-----+-----+--------+--------+-----+------+---------+
 //! ```
 //!
-//! Commands: `0xF5` begin (low address byte is the profile), `0xF3` write,
-//! `0xF2` read request, `0xF1` commit/switch. Reads replay the request's
-//! header and put the requested bytes at the payload offset.
+//! Commands: `0xF5` session frame (argument `0` opens a configuration
+//! session, `1` closes it), `0xF3` write, `0xF2` read request, `0xF1` refresh.
+//! Reads replay the request's header and put the requested bytes at the
+//! payload offset.
+//!
+//! A refresh frame is `{id, F1, 02, flag}`: the two bytes after the command sit
+//! where a register address would, but they are arguments, not an address.
+//! Encoding them as a little-endian address swaps them and the firmware
+//! silently ignores the frame (settings are stored but never reloaded).
 
 use std::fmt;
 
@@ -141,12 +147,13 @@ impl Frame {
         Ok(Frame { report_id, bytes })
     }
 
-    /// `0xF5` begin frame: the profile index travels in the low address byte.
-    pub fn begin(total: usize, report_id: u8, cmd: u8, profile: u8) -> Result<Frame, FrameError> {
-        if profile > 0x0F {
-            return Err(FrameError::UnknownCommand(profile));
+    /// `0xF5` session frame: argument `0` opens a configuration session and `1`
+    /// closes it. The argument travels in the low address byte.
+    pub fn begin(total: usize, report_id: u8, cmd: u8, arg: u8) -> Result<Frame, FrameError> {
+        if arg > 0x0F {
+            return Err(FrameError::UnknownCommand(arg));
         }
-        Self::finish(total, report_id, cmd, profile as u16, 0, &[])
+        Self::finish(total, report_id, cmd, arg as u16, 0, &[])
     }
 
     /// `0xF3` register write at a 16-bit address.
@@ -171,15 +178,10 @@ impl Frame {
         Self::finish(total, report_id, cmd, addr, len, &[])
     }
 
-    /// `0xF1` commit / activate-profile frame.
-    pub fn commit(
-        total: usize,
-        cmd: u8,
-        addr: u16,
-        len: u8,
-        report_id: u8,
-    ) -> Result<Frame, FrameError> {
-        Self::finish(total, report_id, cmd, addr, len, &[])
+    /// `0xF1` refresh frame. `word` is `(mask << 8) | flag`, the two bytes that
+    /// follow the command (`0x0208` is `{.. F1 02 08 ..}`).
+    pub fn commit(total: usize, cmd: u8, word: u16, report_id: u8) -> Result<Frame, FrameError> {
+        Self::finish(total, report_id, cmd, word.swap_bytes(), 0, &[])
     }
 
     /// Large block frame (scroll block or macro record) written to `addr`.
@@ -211,11 +213,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn begin_frame_carries_profile_in_low_address_byte() {
-        let frame = Frame::begin(16, REPORT_REGISTER, CMD_BEGIN, 3).expect("begin frame");
+    fn session_frames_carry_open_and_close_in_the_first_argument_byte() {
+        let open = Frame::begin(16, REPORT_REGISTER, CMD_BEGIN, 0).expect("open");
+        assert_eq!(&open.bytes[..4], &[0x02, 0xF5, 0x00, 0x00]);
+        let close = Frame::begin(16, REPORT_REGISTER, CMD_BEGIN, 1).expect("close");
+        assert_eq!(
+            close.bytes,
+            vec![0x02, 0xF5, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn refresh_frame_puts_mask_then_flag_after_the_command() {
+        // Vendor frame for flag 0x08: 02 F1 02 08 00 ...
+        let frame = Frame::commit(16, CMD_COMMIT, 0x0208, REPORT_REGISTER).expect("refresh");
         assert_eq!(
             frame.bytes,
-            vec![0x02, 0xF5, 0x03, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            vec![0x02, 0xF1, 0x02, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
         );
     }
 

@@ -1,31 +1,42 @@
 # Redragon M721-Pro "Lonewolf2" — Holtek 04d9:fc5c
 #
-# Register layout captured from the vendor application's traffic and the
-# vendored Windows data tree (docs/redragon-gaming-mouse-re.md §5). This
-# descriptor has NOT been confirmed against the attached device yet: reads,
-# the exact LED byte order, and the keymap write addresses still need a live
-# capture, so it stays `verified = false` and the application asks for an
-# extra confirmation before writing through it.
+# Register layout taken from the vendor application's decompiled writers
+# (docs/redragon-gaming-mouse-re.md §5, docs/hardware-checkpoint.md) and checked
+# against the attached mouse. Frame rules the firmware depends on:
+#
+#   * every read/write sits between `F5 00` (open) and `F5 01` (close);
+#   * after writes the vendor sends refresh frames `{02 F1 02 <flag>}` with the
+#     flags 04 01 02 08 10 (`commands.commit_frames`, one word per frame);
+#   * the active profile is register 0x2C, not part of the DPI page.
+#
+# It stays `verified = false` until buttons and macros are confirmed on the
+# device, so the application keeps asking for the extra risk confirmation.
 schema = 1
 id = "holtek-04d9-fc5c"
 model = "Redragon M721-Pro Lonewolf2"
 provenance = "capture"
 verified = false
 notes = """
-Hardware observations (read-only checkpoint, see docs/hardware-checkpoint.md):
-the vendor collection is 0xFFA0 (not 0xFF00), the feature-report table is
-ID 2 = 16 B, 3 = 64 B, 4 = 256 B, 5 = 1024 B, 6 = 2048 B, and a read request
-returns header + requested window. The attached mouse currently reports DPI
-codes 0x0b, 0x17, 0x2f, 0x5f and 0xbc, which are not in tables.dpi_codes, so
-those stages display as unknown and are preserved byte-for-byte.
+Vendor collection is 0xFFA0 and the feature-report table is ID 2 = 16 B,
+3 = 64 B, 4 = 256 B, 5 = 1024 B, 6 = 2048 B.
 
-Known gaps: button keymaps are not declared because the shipped report lists
-model-dependent bases that collide with the DPI page, so a capture is needed
-before any keymap write; the DPI and LED mode tables only hold entries that
-could be established from the report, not the full device tables; macro action
-encoding is a hypothesis (15-byte records, see macros.action_len); no global
-device settings (angle snap, lift-off, scroll, acceleration, double-click) are
-declared because the report does not pin their registers.
+LED record per profile at 0x449 + 8*p (7 bytes): R, G, B, mode, speed, mode2,
+brightness. The vendor's effect list is a (mode, mode2) pair; the labels below
+follow the order of the vendor UI and still need an eyes-on check for the less
+common effects. Effect speed is stored inverted (vendor writes 9 - level) and
+is 0 for effects without a speed.
+
+DPI stage record at page + 2 + 6*s (5 bytes): enabled, code, high flag, 0, 0.
+The code table was generated from the vendor executable. The active stage is
+one byte at the start of each profile page.
+
+Polling codes are the interval in ms: 1 = 1000 Hz, 2 = 500 Hz, 4 = 250 Hz,
+8 = 125 Hz.
+
+Button keymaps and macros are not declared yet (macro records at
+0x478 + 200*slot and the keymap at 0x82 + 4*slot per profile still need
+decoding); no global device settings (angle snap, lift-off, scroll,
+acceleration, double-click) are declared.
 """
 
 [collections]
@@ -52,6 +63,7 @@ len = 256
 
 [profiles]
 count = 5
+active_window = "active_profile"
 
 [commands]
 begin = 0xf5
@@ -60,13 +72,24 @@ read = 0xf2
 commit = 0xf1
 commit_report = 2
 # Vendor apply sequence: {02 F1 02 02} then {02 F1 02 08}.
-commit_frames = [0x0202, 0x0208]
-# Profile activation: write 0x2C = profile, then the vendor's switch commits.
+# Vendor refresh sequence after an apply: {02 F1 02 <flag>} for 04 01 02 08 10.
+commit_frames = [0x0204, 0x0201, 0x0202, 0x0208, 0x0210]
+# Profile switch: write 0x2C = profile, then the full refresh sequence. Flag 01
+# alone updated the register but left the LED on the old profile (checked on the
+# device), so the whole sequence is sent.
 activate_addr = 0x002c
 activate_len = 2
-activate_frames = [0x0201, 0x0208, 0x0204, 0x0202, 0x0208]
+activate_frames = [0x0204, 0x0201, 0x0202, 0x0208, 0x0210]
 
 # --- read windows -----------------------------------------------------------
+
+# Index of the profile the mouse is using.
+[windows.active_profile]
+report = 2
+addr = 0x002c
+len = 2
+count = 1
+per_profile = false
 
 # Profile pages are not a uniform stride apart: the vendor capture and a live
 # read agree on 0x42, 0x102, 0x1B2, 0x262, 0x312.
@@ -98,14 +121,6 @@ stride = 2
 profile_base = 3
 count = 2
 
-[windows.macros]
-report = 4
-addr = 0x0478
-len = 200
-stride = 200
-count = 15
-per_profile = false
-
 # --- DPI --------------------------------------------------------------------
 
 [dpi]
@@ -115,8 +130,8 @@ stage_window_offset = 2
 stage_count = 5
 write_report = 3
 stage_stride = 6
-stage_len = 4
-active_len = 2
+stage_len = 5
+active_len = 1
 per_axis = false
 
 # --- polling rate -----------------------------------------------------------
@@ -133,21 +148,22 @@ offset = 0
 window = "polling_hi"
 offset = 0
 
+# The code is the polling interval in milliseconds.
 [[polling.codes]]
 hz = 125
-code = 0x01
+code = 0x08
 
 [[polling.codes]]
 hz = 250
-code = 0x02
-
-[[polling.codes]]
-hz = 500
 code = 0x04
 
 [[polling.codes]]
+hz = 500
+code = 0x02
+
+[[polling.codes]]
 hz = 1000
-code = 0x08
+code = 0x01
 
 # --- lighting ---------------------------------------------------------------
 
@@ -156,49 +172,319 @@ window = "led"
 write_addrs = [0x0449, 0x0451, 0x0459, 0x0461, 0x0469]
 color_offset = 0
 mode_offset = 3
-# Vendor writer layout: colour at +0..2, mode byte 0 at +3, speed at +4,
-# mode byte 1 at +5, brightness in a separate one-byte write at +6.
+mode2_offset = 5
 speed_offset = 4
 brightness_offset = 6
 brightness_levels = 4
-# Observed speeds on this device are 2 and 4; the exact top level still needs a
-# capture, so 0..4 is offered.
-speed_levels = 5
+# The register holds 0..8 and a larger value is slower (vendor: 9 - level).
+speed_levels = 9
+speed_inverted = true
+
+# Effect codes are (mode << 8) | mode2 from the vendor's LED writer.
+[[lighting.modes]]
+id = "breathing"
+label = "Breathing"
+code = 0x0104
+uses_color = true
+uses_speed = true
 
 [[lighting.modes]]
-id = "static"
-label = "Static"
-code = 0x08
+id = "rainbow"
+label = "Rainbow"
+code = 0x0108
+uses_speed = true
+
+[[lighting.modes]]
+id = "steady"
+label = "Full lighted"
+code = 0x0102
 uses_color = true
+
+[[lighting.modes]]
+id = "wave"
+label = "Wave"
+code = 0x0200
+uses_speed = true
+
+[[lighting.modes]]
+id = "trace"
+label = "Go without trace"
+code = 0x0600
+uses_color = true
+uses_speed = true
+
+[[lighting.modes]]
+id = "reactive"
+label = "Reactive"
+code = 0x0700
+uses_color = true
+uses_speed = true
+
+[[lighting.modes]]
+id = "flash"
+label = "Flash"
+code = 0x0110
+uses_color = true
+uses_speed = true
 
 [[lighting.modes]]
 id = "off"
 label = "Off"
-code = 0x00
+code = 0x0000
 
 # --- buttons ----------------------------------------------------------------
 
 # --- macros -----------------------------------------------------------------
 
-[macros]
-slots = 15
-window = "macros"
-base = 0x0478
-slot_stride = 200
-report = 4
-record_len = 200
-action_len = 15
-max_actions = 13
+# Not declared: the record encoding at 0x478 + 200*slot is still a guess, and a
+# wrong write would corrupt the stored macros. Reads of that area return zeros.
 
 # --- tables -----------------------------------------------------------------
 
-[[tables.dpi_codes]]
-dpi = 1000
-code = 0x0016
-
-[[tables.dpi_codes]]
-dpi = 5000
-code = 0x0073
+# DPI -> register code for sensor 0xD07 (M721-PRO), generated from the vendor
+# executable's tables (RDCfg.exe 0x4bae1c idx<=160, 0x4bad7c idx>160).
+# code = value | flag << 8. Codes shared by two DPI values keep the higher one.
+[tables]
+dpi_codes = [
+  { dpi = 100, code = 0x0000 },
+  { dpi = 200, code = 0x0002 },
+  { dpi = 300, code = 0x0003 },
+  { dpi = 400, code = 0x0004 },
+  { dpi = 500, code = 0x0005 },
+  { dpi = 600, code = 0x0006 },
+  { dpi = 700, code = 0x0007 },
+  { dpi = 800, code = 0x0009 },
+  { dpi = 900, code = 0x000a },
+  { dpi = 1000, code = 0x000b },
+  { dpi = 1100, code = 0x000c },
+  { dpi = 1200, code = 0x000d },
+  { dpi = 1300, code = 0x000e },
+  { dpi = 1400, code = 0x0010 },
+  { dpi = 1500, code = 0x0011 },
+  { dpi = 1600, code = 0x0012 },
+  { dpi = 1700, code = 0x0013 },
+  { dpi = 1800, code = 0x0014 },
+  { dpi = 1900, code = 0x0016 },
+  { dpi = 2000, code = 0x0017 },
+  { dpi = 2100, code = 0x0018 },
+  { dpi = 2200, code = 0x0019 },
+  { dpi = 2300, code = 0x001a },
+  { dpi = 2400, code = 0x001b },
+  { dpi = 2500, code = 0x001d },
+  { dpi = 2600, code = 0x001e },
+  { dpi = 2700, code = 0x001f },
+  { dpi = 2800, code = 0x0020 },
+  { dpi = 2900, code = 0x0021 },
+  { dpi = 3000, code = 0x0023 },
+  { dpi = 3100, code = 0x0025 },
+  { dpi = 3200, code = 0x0026 },
+  { dpi = 3300, code = 0x0027 },
+  { dpi = 3400, code = 0x0028 },
+  { dpi = 3500, code = 0x0029 },
+  { dpi = 3600, code = 0x002a },
+  { dpi = 3700, code = 0x002c },
+  { dpi = 3800, code = 0x002d },
+  { dpi = 3900, code = 0x002e },
+  { dpi = 4000, code = 0x002f },
+  { dpi = 4100, code = 0x0030 },
+  { dpi = 4200, code = 0x0032 },
+  { dpi = 4300, code = 0x0033 },
+  { dpi = 4400, code = 0x0034 },
+  { dpi = 4500, code = 0x0035 },
+  { dpi = 4600, code = 0x0036 },
+  { dpi = 4700, code = 0x0038 },
+  { dpi = 4800, code = 0x0039 },
+  { dpi = 4900, code = 0x003a },
+  { dpi = 5000, code = 0x003b },
+  { dpi = 5100, code = 0x003c },
+  { dpi = 5200, code = 0x003e },
+  { dpi = 5300, code = 0x003f },
+  { dpi = 5400, code = 0x0040 },
+  { dpi = 5500, code = 0x0041 },
+  { dpi = 5600, code = 0x0042 },
+  { dpi = 5700, code = 0x0044 },
+  { dpi = 5800, code = 0x0045 },
+  { dpi = 5900, code = 0x0046 },
+  { dpi = 6000, code = 0x0047 },
+  { dpi = 6100, code = 0x0048 },
+  { dpi = 6200, code = 0x004a },
+  { dpi = 6300, code = 0x004b },
+  { dpi = 6400, code = 0x004c },
+  { dpi = 6500, code = 0x004d },
+  { dpi = 6600, code = 0x004e },
+  { dpi = 6700, code = 0x0050 },
+  { dpi = 6800, code = 0x0051 },
+  { dpi = 6900, code = 0x0052 },
+  { dpi = 7000, code = 0x0053 },
+  { dpi = 7100, code = 0x0054 },
+  { dpi = 7200, code = 0x0056 },
+  { dpi = 7300, code = 0x0057 },
+  { dpi = 7400, code = 0x0058 },
+  { dpi = 7500, code = 0x0059 },
+  { dpi = 7600, code = 0x005a },
+  { dpi = 7700, code = 0x005c },
+  { dpi = 7800, code = 0x005d },
+  { dpi = 7900, code = 0x005e },
+  { dpi = 8000, code = 0x005f },
+  { dpi = 8100, code = 0x0060 },
+  { dpi = 8200, code = 0x0062 },
+  { dpi = 8300, code = 0x0063 },
+  { dpi = 8400, code = 0x0064 },
+  { dpi = 8500, code = 0x0065 },
+  { dpi = 8600, code = 0x0066 },
+  { dpi = 8700, code = 0x0068 },
+  { dpi = 8800, code = 0x0069 },
+  { dpi = 8900, code = 0x006a },
+  { dpi = 9000, code = 0x006b },
+  { dpi = 9100, code = 0x006c },
+  { dpi = 9200, code = 0x006e },
+  { dpi = 9300, code = 0x006f },
+  { dpi = 9400, code = 0x0070 },
+  { dpi = 9500, code = 0x0071 },
+  { dpi = 9600, code = 0x0072 },
+  { dpi = 9700, code = 0x0074 },
+  { dpi = 9800, code = 0x0075 },
+  { dpi = 9900, code = 0x0076 },
+  { dpi = 10000, code = 0x0077 },
+  { dpi = 10100, code = 0x0078 },
+  { dpi = 10200, code = 0x007a },
+  { dpi = 10300, code = 0x007b },
+  { dpi = 10400, code = 0x007c },
+  { dpi = 10500, code = 0x007d },
+  { dpi = 10600, code = 0x007e },
+  { dpi = 10700, code = 0x0080 },
+  { dpi = 10800, code = 0x0081 },
+  { dpi = 10900, code = 0x0082 },
+  { dpi = 11000, code = 0x0083 },
+  { dpi = 11100, code = 0x0084 },
+  { dpi = 11200, code = 0x0086 },
+  { dpi = 11300, code = 0x0087 },
+  { dpi = 11400, code = 0x0088 },
+  { dpi = 11500, code = 0x0089 },
+  { dpi = 11600, code = 0x008a },
+  { dpi = 11700, code = 0x008c },
+  { dpi = 11800, code = 0x008d },
+  { dpi = 11900, code = 0x008e },
+  { dpi = 12000, code = 0x008f },
+  { dpi = 12100, code = 0x0090 },
+  { dpi = 12200, code = 0x0092 },
+  { dpi = 12300, code = 0x0093 },
+  { dpi = 12400, code = 0x0094 },
+  { dpi = 12500, code = 0x0095 },
+  { dpi = 12600, code = 0x0096 },
+  { dpi = 12700, code = 0x0098 },
+  { dpi = 12800, code = 0x0099 },
+  { dpi = 12900, code = 0x009a },
+  { dpi = 13000, code = 0x009b },
+  { dpi = 13100, code = 0x009c },
+  { dpi = 13200, code = 0x009e },
+  { dpi = 13300, code = 0x009f },
+  { dpi = 13400, code = 0x00a0 },
+  { dpi = 13500, code = 0x00a1 },
+  { dpi = 13600, code = 0x00a2 },
+  { dpi = 13700, code = 0x00a4 },
+  { dpi = 13800, code = 0x00a5 },
+  { dpi = 13900, code = 0x00a6 },
+  { dpi = 14000, code = 0x00a7 },
+  { dpi = 14100, code = 0x00a8 },
+  { dpi = 14200, code = 0x00aa },
+  { dpi = 14300, code = 0x00ab },
+  { dpi = 14400, code = 0x00ac },
+  { dpi = 14500, code = 0x00ad },
+  { dpi = 14600, code = 0x00ae },
+  { dpi = 14700, code = 0x00b0 },
+  { dpi = 14800, code = 0x00b1 },
+  { dpi = 14900, code = 0x00b2 },
+  { dpi = 15000, code = 0x00b3 },
+  { dpi = 15100, code = 0x00b4 },
+  { dpi = 15200, code = 0x00b5 },
+  { dpi = 15300, code = 0x00b6 },
+  { dpi = 15400, code = 0x00b7 },
+  { dpi = 15500, code = 0x00b8 },
+  { dpi = 15600, code = 0x00b9 },
+  { dpi = 15700, code = 0x00ba },
+  { dpi = 15800, code = 0x00bb },
+  { dpi = 16000, code = 0x00bc },
+  { dpi = 16200, code = 0x0190 },
+  { dpi = 16400, code = 0x0192 },
+  { dpi = 16600, code = 0x0193 },
+  { dpi = 16800, code = 0x0194 },
+  { dpi = 17000, code = 0x0195 },
+  { dpi = 17200, code = 0x0196 },
+  { dpi = 17400, code = 0x0198 },
+  { dpi = 17600, code = 0x0199 },
+  { dpi = 17800, code = 0x019a },
+  { dpi = 18000, code = 0x019b },
+  { dpi = 18200, code = 0x019c },
+  { dpi = 18400, code = 0x019e },
+  { dpi = 18600, code = 0x019f },
+  { dpi = 18800, code = 0x01a0 },
+  { dpi = 19000, code = 0x01a1 },
+  { dpi = 19200, code = 0x01a2 },
+  { dpi = 19400, code = 0x01a4 },
+  { dpi = 19600, code = 0x01a5 },
+  { dpi = 19800, code = 0x01a6 },
+  { dpi = 20000, code = 0x01a7 },
+  { dpi = 20200, code = 0x01a8 },
+  { dpi = 20400, code = 0x01aa },
+  { dpi = 20600, code = 0x01ab },
+  { dpi = 20800, code = 0x01ac },
+  { dpi = 21000, code = 0x01ad },
+  { dpi = 21200, code = 0x01ae },
+  { dpi = 21400, code = 0x01b0 },
+  { dpi = 21600, code = 0x01b1 },
+  { dpi = 21800, code = 0x01b2 },
+  { dpi = 22000, code = 0x01b3 },
+  { dpi = 22200, code = 0x01b4 },
+  { dpi = 22400, code = 0x01b5 },
+  { dpi = 22600, code = 0x01b6 },
+  { dpi = 22800, code = 0x01b7 },
+  { dpi = 23000, code = 0x01b8 },
+  { dpi = 23200, code = 0x01b9 },
+  { dpi = 23400, code = 0x01ba },
+  { dpi = 23600, code = 0x01bb },
+  { dpi = 24000, code = 0x01bc },
+  { dpi = 24200, code = 0x0104 },
+  { dpi = 24400, code = 0x0106 },
+  { dpi = 24600, code = 0x0109 },
+  { dpi = 24800, code = 0x010b },
+  { dpi = 25000, code = 0x010e },
+  { dpi = 25200, code = 0x0110 },
+  { dpi = 25400, code = 0x0112 },
+  { dpi = 25600, code = 0x0115 },
+  { dpi = 25800, code = 0x0117 },
+  { dpi = 26000, code = 0x0119 },
+  { dpi = 26200, code = 0x011b },
+  { dpi = 26400, code = 0x011d },
+  { dpi = 26600, code = 0x0120 },
+  { dpi = 26800, code = 0x0122 },
+  { dpi = 27000, code = 0x0124 },
+  { dpi = 27200, code = 0x0127 },
+  { dpi = 27400, code = 0x0129 },
+  { dpi = 27600, code = 0x012b },
+  { dpi = 27800, code = 0x012e },
+  { dpi = 28000, code = 0x0130 },
+  { dpi = 28200, code = 0x0132 },
+  { dpi = 28400, code = 0x0134 },
+  { dpi = 28600, code = 0x0137 },
+  { dpi = 28800, code = 0x0139 },
+  { dpi = 29000, code = 0x013b },
+  { dpi = 29200, code = 0x013e },
+  { dpi = 29400, code = 0x0140 },
+  { dpi = 29600, code = 0x0142 },
+  { dpi = 29800, code = 0x0145 },
+  { dpi = 30000, code = 0x0148 },
+  { dpi = 30200, code = 0x014a },
+  { dpi = 30400, code = 0x014d },
+  { dpi = 30600, code = 0x014e },
+  { dpi = 30800, code = 0x0151 },
+  { dpi = 31000, code = 0x0154 },
+  { dpi = 31200, code = 0x0155 },
+  { dpi = 31400, code = 0x0158 },
+  { dpi = 31600, code = 0x015b },
+  { dpi = 31800, code = 0x015d },
+  { dpi = 32000, code = 0x015f },
+]
 
 [[tables.actions]]
 id = "default"

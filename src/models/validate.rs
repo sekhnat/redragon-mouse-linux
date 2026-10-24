@@ -22,6 +22,13 @@ pub fn validate(desc: &Descriptor) -> Vec<String> {
     if desc.profiles.count == 0 {
         errors.push("profiles.count must be at least 1".into());
     }
+    if let Some(window) = &desc.profiles.active_window {
+        if !desc.windows.contains_key(window) {
+            errors.push(format!(
+                "profiles.active_window references unknown window `{window}`"
+            ));
+        }
+    }
     let mut frame_ids = BTreeMap::new();
     for frame in &desc.frames {
         if frame.len < 9 {
@@ -245,13 +252,28 @@ pub fn validate(desc: &Descriptor) -> Vec<String> {
         for mode in &lighting.modes {
             if let Some(prev) = mode_codes.insert(mode.code, mode.id.clone()) {
                 errors.push(format!(
-                    "lighting.modes reuses code {:#04x} for `{prev}` and `{}`",
+                    "lighting.modes reuses code {:#06x} for `{prev}` and `{}`",
                     mode.code, mode.id
                 ));
             }
         }
+        if let Some(mode2) = lighting.mode2_offset {
+            if mode2 == lighting.mode_offset {
+                errors.push("lighting.mode2_offset must differ from mode_offset".into());
+            }
+        } else if let Some(mode) = lighting.modes.iter().find(|m| m.code > 0xff) {
+            errors.push(format!(
+                "lighting mode `{}` has a two-byte code but mode2_offset is not set",
+                mode.id
+            ));
+        }
         for (id, offset, width) in [
             ("mode", lighting.mode_offset, 1u16),
+            (
+                "mode2",
+                lighting.mode2_offset.unwrap_or(lighting.mode_offset),
+                1,
+            ),
             ("speed", lighting.speed_offset, 1),
             ("brightness", lighting.brightness_offset, 1),
             ("colour", lighting.color_offset, 3),
