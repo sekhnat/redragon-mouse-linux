@@ -1,0 +1,33 @@
+[package]
+name = "redragon-gui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+description = "Linux GUI configuration tool for Redragon/Holtek USB gaming mice"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/redragon-gui"
+readme = "README.md"
+
+[dependencies]
+eframe = { version = "0.37", default-features = false, features = [
+    "default_fonts",
+    "glow",
+    "wayland",
+    "x11",
+] }
+egui = "0.37"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 2
+lto = "thin"
+strip = true

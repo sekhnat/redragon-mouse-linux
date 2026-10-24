@@ -1,0 +1,367 @@
+# Redragon M721-Pro "Lonewolf2" — Holtek 04d9:fc5c
+#
+# Register layout captured from the vendor application's traffic and the
+# vendored Windows data tree (docs/redragon-gaming-mouse-re.md §5). This
+# descriptor has NOT been confirmed against the attached device yet: reads,
+# the exact LED byte order, and the keymap write addresses still need a live
+# capture, so it stays `verified = false` and the application asks for an
+# extra confirmation before writing through it.
+schema = 1
+id = "holtek-04d9-fc5c"
+model = "Redragon M721-Pro Lonewolf2"
+provenance = "capture"
+verified = false
+notes = """
+Hardware observations (read-only checkpoint, see docs/hardware-checkpoint.md):
+the vendor collection is 0xFFA0 (not 0xFF00), the feature-report table is
+ID 2 = 16 B, 3 = 64 B, 4 = 256 B, 5 = 1024 B, 6 = 2048 B, and a read request
+returns header + requested window. The attached mouse currently reports DPI
+codes 0x0b, 0x17, 0x2f, 0x5f and 0xbc, which are not in tables.dpi_codes, so
+those stages display as unknown and are preserved byte-for-byte.
+
+Known gaps: button keymaps are not declared because the shipped report lists
+model-dependent bases that collide with the DPI page, so a capture is needed
+before any keymap write; the DPI and LED mode tables only hold entries that
+could be established from the report, not the full device tables; macro action
+encoding is a hypothesis (15-byte records, see macros.action_len); no global
+device settings (angle snap, lift-off, scroll, acceleration, double-click) are
+declared because the report does not pin their registers.
+"""
+
+[collections]
+# Read from the device: the vendor collection is 0xFFA0, not the 0xFF00
+# the Windows-app analysis assumed (newer Holtek firmware generation).
+usage_page = 0xffa0
+usage = 0x01
+
+# Feature-report table read from the device's report descriptor:
+# ID 2 = 16 B (register frames), ID 3 = 64 B (block frames),
+# ID 4 = 256 B (macro records; payload capacity 248).
+# The descriptor also declares 1024 B / 2048 B reports as IDs 5 and 6.
+[[frames]]
+id = 2
+len = 16
+
+[[frames]]
+id = 3
+len = 64
+
+[[frames]]
+id = 4
+len = 256
+
+[profiles]
+count = 5
+
+[commands]
+begin = 0xf5
+write = 0xf3
+read = 0xf2
+commit = 0xf1
+commit_report = 2
+# Vendor apply sequence: {02 F1 02 02} then {02 F1 02 08}.
+commit_frames = [0x0202, 0x0208]
+# Profile activation: write 0x2C = profile, then the vendor's switch commits.
+activate_addr = 0x002c
+activate_len = 2
+activate_frames = [0x0201, 0x0208, 0x0204, 0x0202, 0x0208]
+
+# --- read windows -----------------------------------------------------------
+
+# Profile pages are not a uniform stride apart: the vendor capture and a live
+# read agree on 0x42, 0x102, 0x1B2, 0x262, 0x312.
+[windows.profile_page]
+report = 3
+count = 5
+len = 32
+addrs = [0x0042, 0x0102, 0x01b2, 0x0262, 0x0312]
+
+[windows.led]
+report = 2
+addr = 0x0449
+len = 7
+stride = 8
+count = 5
+
+[windows.polling_lo]
+report = 2
+addr = 0x0032
+len = 5
+stride = 2
+count = 3
+
+[windows.polling_hi]
+report = 2
+addr = 0x0038
+len = 3
+stride = 2
+profile_base = 3
+count = 2
+
+[windows.macros]
+report = 4
+addr = 0x0478
+len = 200
+stride = 200
+count = 15
+per_profile = false
+
+# --- DPI --------------------------------------------------------------------
+
+[dpi]
+window = "profile_page"
+active_window_offset = 0
+stage_window_offset = 2
+stage_count = 5
+write_report = 3
+stage_stride = 6
+stage_len = 4
+active_len = 2
+per_axis = false
+
+# --- polling rate -----------------------------------------------------------
+
+[polling]
+write_addrs = [0x0032, 0x0034, 0x0036, 0x0038, 0x003a]
+write_len = 1
+
+[[polling.sources]]
+window = "polling_lo"
+offset = 0
+
+[[polling.sources]]
+window = "polling_hi"
+offset = 0
+
+[[polling.codes]]
+hz = 125
+code = 0x01
+
+[[polling.codes]]
+hz = 250
+code = 0x02
+
+[[polling.codes]]
+hz = 500
+code = 0x04
+
+[[polling.codes]]
+hz = 1000
+code = 0x08
+
+# --- lighting ---------------------------------------------------------------
+
+[lighting]
+window = "led"
+write_addrs = [0x0449, 0x0451, 0x0459, 0x0461, 0x0469]
+color_offset = 0
+mode_offset = 3
+speed_offset = 5
+brightness_offset = 6
+brightness_levels = 4
+speed_levels = 4
+
+[[lighting.modes]]
+id = "static"
+label = "Static"
+code = 0x08
+uses_color = true
+
+[[lighting.modes]]
+id = "off"
+label = "Off"
+code = 0x00
+
+# --- buttons ----------------------------------------------------------------
+
+# --- macros -----------------------------------------------------------------
+
+[macros]
+slots = 15
+window = "macros"
+base = 0x0478
+slot_stride = 200
+report = 4
+record_len = 200
+action_len = 15
+max_actions = 13
+
+# --- tables -----------------------------------------------------------------
+
+[[tables.dpi_codes]]
+dpi = 1000
+code = 0x0016
+
+[[tables.dpi_codes]]
+dpi = 5000
+code = 0x0073
+
+[[tables.actions]]
+id = "default"
+label = "Default"
+code = 0x00
+kind = "default"
+
+[[tables.actions]]
+id = "disabled"
+label = "Disabled"
+code = 0x01
+kind = "disabled"
+
+[[tables.actions]]
+id = "left"
+label = "Left click"
+code = 0x02
+kind = "mouse"
+
+[[tables.actions]]
+id = "right"
+label = "Right click"
+code = 0x03
+kind = "mouse"
+
+[[tables.actions]]
+id = "middle"
+label = "Middle click"
+code = 0x04
+kind = "mouse"
+
+[[tables.actions]]
+id = "back"
+label = "Back"
+code = 0x05
+kind = "mouse"
+
+[[tables.actions]]
+id = "forward"
+label = "Forward"
+code = 0x06
+kind = "mouse"
+
+[[tables.actions]]
+id = "dpi-cycle"
+label = "DPI cycle"
+code = 0x10
+kind = "dpi"
+
+[[tables.actions]]
+id = "sniper"
+label = "Sniper"
+code = 0x11
+kind = "sniper"
+
+[[tables.actions]]
+id = "profile-next"
+label = "Next profile"
+code = 0x12
+kind = "profile"
+
+[[tables.actions]]
+id = "play-pause"
+label = "Play / pause"
+code = 0x20
+kind = "multimedia"
+
+[[tables.actions]]
+id = "macro"
+label = "Macro"
+code = 0x30
+kind = "macro"
+
+[[tables.keys]]
+id = "esc"
+label = "Esc"
+usage = 0x29
+
+[[tables.keys]]
+id = "tab"
+label = "Tab"
+usage = 0x2b
+
+[[tables.keys]]
+id = "enter"
+label = "Enter"
+usage = 0x28
+
+[[tables.keys]]
+id = "backspace"
+label = "Backspace"
+usage = 0x2a
+
+[[tables.keys]]
+id = "space"
+label = "Space"
+usage = 0x2c
+
+[[tables.keys]]
+id = "delete"
+label = "Delete"
+usage = 0x4c
+
+[[tables.keys]]
+id = "a"
+label = "A"
+usage = 0x04
+
+[[tables.keys]]
+id = "b"
+label = "B"
+usage = 0x05
+
+[[tables.keys]]
+id = "c"
+label = "C"
+usage = 0x06
+
+[[tables.keys]]
+id = "f1"
+label = "F1"
+usage = 0x3a
+
+[[tables.keys]]
+id = "f2"
+label = "F2"
+usage = 0x3b
+
+[[tables.keys]]
+id = "f5"
+label = "F5"
+usage = 0x3c
+
+[[tables.keys]]
+id = "up"
+label = "Arrow up"
+usage = 0x52
+
+[[tables.keys]]
+id = "down"
+label = "Arrow down"
+usage = 0x51
+
+[[tables.keys]]
+id = "left"
+label = "Arrow left"
+usage = 0x50
+
+[[tables.keys]]
+id = "right"
+label = "Arrow right"
+usage = 0x4f
+
+[[tables.keys]]
+id = "ctrl"
+label = "Ctrl"
+usage = 0xe0
+modifiers = 0x01
+
+[[tables.keys]]
+id = "shift"
+label = "Shift"
+usage = 0xe1
+modifiers = 0x02
+
+[[tables.keys]]
+id = "alt"
+label = "Alt"
+usage = 0xe2
+modifiers = 0x04

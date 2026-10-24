@@ -1,0 +1,11 @@
+# Rust build output
+/target
+
+# Local tooling / agent state
+/.pi/
+
+# Screenshot scratch files (committed screenshots live in docs/screenshots)
+*.ppm
+
+# Vendored proprietary Windows package: reference material only, not redistributed
+/REDRAGON Gaming Mouse/

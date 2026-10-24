@@ -1,0 +1,16 @@
+# udev rule for the Redragon M721-Pro (Holtek 04d9:fc5c) vendor interface.
+#
+# TAG+="uaccess" grants the locally logged-in user access to the node while
+# keeping it root-owned, which is what the tool needs. Adjust the ids (or add
+# a second rule) for another supported model.
+#
+# Install:
+#   sudo cp 99-redragon-gui.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+# Then reconnect the mouse.
+#
+# If logind does not apply the uaccess ACL on your system (check with
+# `getfacl /dev/hidrawN` while the mouse is connected), grant the group
+# explicitly instead:
+#   KERNEL=="hidraw*", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="fc5c", GROUP="users", MODE="0660", TAG+="uaccess"
+KERNEL=="hidraw*", ATTRS{idVendor}=="04d9", ATTRS{idProduct}=="fc5c", MODE="0660", TAG+="uaccess"

@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Redragon Mouse
+GenericName=Gaming Mouse Configuration
+Comment=Configure DPI, lighting, profiles, and macros on Redragon/Holtek mice
+Exec=redragon-gui
+Icon=redragon-gui
+Terminal=false
+Categories=Settings;HardwareSettings;Utility;
+Keywords=mouse;gaming;dpi;led;macro;redragon;holtek;
+StartupNotify=true

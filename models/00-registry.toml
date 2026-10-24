@@ -1,0 +1,12 @@
+# Model registry. Each entry maps observed USB IDs to a descriptor file.
+#
+# `bcd_min`/`bcd_max` are inclusive device-release bounds; leaving both at 0
+# matches any release. When several entries match, the narrowest range wins.
+schema = 1
+
+[[devices]]
+descriptor = "holtek-04d9-fc5c.toml"
+vendor_id = 0x04d9
+product_id = 0xfc5c
+bcd_min = 0x0100
+bcd_max = 0x01ff

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.redragon_gui.redragon-gui</id>
+  <name>Redragon Mouse</name>
+  <summary>Configure Redragon/Holtek gaming mice on Linux</summary>
+  <description>
+    <p>
+      A native Linux configuration tool for Redragon/Holtek USB gaming mice. It reads the
+      mouse's registers through HID feature reports, lets you review every change before it is
+      written, verifies the write by reading the registers back, and keeps a timestamped backup
+      of the values it replaced.
+    </p>
+    <p>
+      Supported settings depend on the model descriptor: DPI stages, polling rate, lighting,
+      onboard profiles, button mappings, macros, and global pointer settings. Unsupported or
+      unverified capabilities are shown as such instead of being guessed.
+    </p>
+  </description>
+  <launchable type="desktop-id">redragon-gui.desktop</launchable>
+  <url type="homepage">https://example.invalid/redragon-gui</url>
+  <provides>
+    <binary>redragon-gui</binary>
+  </provides>
+  <categories>
+    <category>Settings</category>
+    <category>HardwareSettings</category>
+  </categories>
+  <content_rating type="oars-1.1"/>
+  <releases>
+    <release version="0.1.0" date="2026-10-24">
+      <description>
+        <p>First release: device discovery, read-back-first settings engine, backups, and the
+        editor screens described in the project's OpenSpec change.</p>
+      </description>
+    </release>
+  </releases>
+</component>
