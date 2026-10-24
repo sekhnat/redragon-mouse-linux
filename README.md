@@ -1,45 +1,135 @@
-# Redragon Mouse (Linux)
+# Redragon Mouse for Linux
 
-A native Linux configuration tool for Redragon/Holtek USB gaming mice. It speaks the mouse's
-HID feature-report protocol directly through `/dev/hidraw`, reads the current settings before
-showing anything editable, and applies changes as a reviewed, backed-up, verified transaction.
+<p align="center">
+  <img src="docs/screenshots/device.png" alt="Device overview in simulation mode" width="900">
+</p>
 
-The protocol it implements is documented in
-[`docs/redragon-gaming-mouse-re.md`](docs/redragon-gaming-mouse-re.md), produced by reverse
-engineering the vendor's Windows application that ships in this repository.
+**A native Linux configuration tool for Redragon/Holtek USB gaming mice** — DPI, polling rate, lighting, profiles, button mappings and macros, without the vendor's Windows application.
 
-## Status
+[![License](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Platform](https://img.shields.io/badge/platform-Linux-lightgrey.svg)](#requirements)
+[![Rust](https://img.shields.io/badge/rust-1.82%2B-orange.svg)](#build-from-source)
+[![Status](https://img.shields.io/badge/status-alpha-orange.svg)](#supported-hardware)
 
-- **Platform:** Linux only. The device stack is hidraw; there is no libusb dependency, no kernel
-  module, and no attempt to run the Windows application under Wine.
-- **Model support is data-driven.** `models/00-registry.toml` maps USB IDs to a TOML descriptor.
-  The bundled `04d9:fc5c` (M721-Pro "Lonewolf2") descriptor is marked **unverified**: every write
-  through it requires an extra acknowledgement, and a few capabilities are deliberately absent
-  because the report does not pin their registers:
-  - button keymaps are not declared (the documented keymap bases collide with the DPI page), so
-    the Buttons screen shows an explicit read-only explanation instead of guessing;
-  - only the documented LED static/off codes are present;
-  - macro action encoding is a documented hypothesis;
-  - angle snap, lift-off, scroll, acceleration, and double-click registers are not declared.
-- **Read-back is enforced.** If the device cannot provide a consistent register image, the tool
-  stays read-only and says why. There is no "write anyway" escape hatch.
-- **Hardware checkpoint (`04d9:fc5c`):** the interface's real report descriptor uses vendor page
-  `0xFFA0` (not `0xFF00`) and feature reports ID 2 = 16 B, 3 = 64 B, 4 = 256 B, 5 = 1024 B,
-  6 = 2048 B. Reads are consistent across runs, and one LED-brightness write was applied,
-  confirmed by read-back, and restored from its backup. The DPI and LED-mode tables are still
-  incomplete for this PID, so those values display as unknown and are preserved; the descriptor
-  therefore stays unverified. Details, raw dumps and the commit sequence:
-  [`docs/hardware-checkpoint.md`](docs/hardware-checkpoint.md).
+`redragon-gui` speaks the mouse's HID feature-report protocol directly over `/dev/hidraw`. It
+reads the current register state before showing anything editable, applies changes as a reviewed
+transaction with a backup and read-back verification, and reports exactly what the mouse did — or
+did not — accept.
 
-## Build
+> **Project status: alpha.** The transport, the read path, and one write path (LED brightness) are
+> verified on a Redragon M721-Pro (`04d9:fc5c`). That model's descriptor is still marked
+> **unverified** because its DPI and LED-mode tables are incomplete; every write therefore requires
+> an explicit risk acknowledgement. Details: [`docs/hardware-checkpoint.md`](docs/hardware-checkpoint.md).
+
+## Contents
+
+- [Why this exists](#why-this-exists)
+- [Features](#features)
+- [Supported hardware](#supported-hardware)
+- [Safety model](#safety-model)
+- [Requirements](#requirements)
+- [Build from source](#build-from-source)
+- [Install](#install)
+- [Usage](#usage)
+- [Screenshots](#screenshots)
+- [Model descriptors](#model-descriptors)
+- [Project layout](#project-layout)
+- [Testing](#testing)
+- [Known limitations](#known-limitations)
+- [Documentation](#documentation)
+- [Contributing](#contributing)
+- [License and provenance](#license-and-provenance)
+
+## Why this exists
+
+The vendor configuration application is a Windows-only binary that reaches the mouse through
+Windows' HID stack. On Linux the mouse is already fully usable: the kernel exposes its vendor
+interface as a plain `/dev/hidraw` node, and every setting is an ordinary HID feature report. What
+was missing was a tool that treats that protocol as what it is — a memory-mapped register file with
+real consequences — instead of a set of magic writes.
+
+This project provides that tool, plus the reverse-engineering notes and hardware checkpoint behind
+its model data. It is not a wrapper around the Windows application and does not require Wine, a
+kernel module, `libusb`, or root.
+
+## Features
+
+- **Read-back-first configuration.** Nothing is shown as a device value unless it was read from the
+  device in this session, twice, with matching results.
+- **Reviewed, verified writes.** A change is shown as a before/after register diff, backed up,
+  written with the vendor's begin/commit framing, and then read back. Mismatches are reported as
+  "not confirmed" and never presented as success.
+- **Automatic backup and restore.** Every apply stores the pre-change values as timestamped JSON;
+  restore replays through the same validated path.
+- **Data-driven model support.** A TOML descriptor declares the register windows, write regions,
+  encoding tables, capabilities and provenance. Adding a model is a data change, validated at load.
+- **Honest capability reporting.** Unsupported features are absent or explained, unreadable
+  registers mark the device read-only, unknown register codes are preserved rather than guessed.
+- **Editors** for DPI stages and polling, lighting (effect, RGB/HSV/hex, brightness, zones),
+  profiles (activate, copy, reset, vendor `.prof` import/export), buttons (actions, keys, combos),
+  macros (ordered actions, burst fire, portable files), and backups.
+- **Diagnostics without privilege escalation.** Missing access prints the node path, mode, owner,
+  and the exact udev rule; the application never asks for or uses elevated privileges.
+- **CLI and simulation.** Headless device listing, raw/decoded state dumps, report-descriptor dump,
+  and a full GUI simulation mode for working without hardware.
+- **Hotplug-aware.** Disconnects keep pending edits; reconnects re-read the device and warn before
+  those edits are applied.
+
+## Supported hardware
+
+| Device | USB ID | State | Notes |
+|---|---|---|---|
+| Redragon M721-Pro "Lonewolf2" | `04d9:fc5c` | Read verified, brightness write verified, descriptor **unverified** | DPI and LED-mode tables incomplete; button keymaps and global pointer settings not declared |
+| Other Redragon/Holtek models | — | Not supported yet | Add a descriptor after capturing the model (see [Model descriptors](#model-descriptors)) |
+
+The attached device was identified as an M721-Pro by its USB ID and the vendor data tree; the
+report-descriptor facts (vendor page `0xFFA0`, feature reports 2–6) were read from the hardware.
+
+## Safety model
+
+A configuration write to the wrong register can make a mouse awkward or impossible to use. The
+tool is built around that risk:
+
+1. **Read twice.** Every declared register window is read twice; the images must match and must not
+   be all-zero/all-`0xFF` filler. Otherwise the device is read-only.
+2. **Validate everything.** Enumerated values, ranges, address bounds, descriptor tables and macro
+   limits are checked before the first frame. Invalid state sends nothing.
+3. **Review the change set.** Apply lists every register with its before and after values. An
+   unverified descriptor adds a one-time risk acknowledgement per session.
+4. **Detect external changes.** The targeted registers are re-read before writing; if they changed
+   since the baseline, the apply is refused until you explicitly choose "write anyway".
+5. **Back up first.** A timestamped JSON backup of the pre-apply values is written before any
+   frame is sent.
+6. **Write transactionally.** Per-profile begin/write/commit framing with the documented pacing;
+   a mid-transaction failure triggers a rollback of the registers already written.
+7. **Verify by read-back.** Every written register is read back and compared. The report names any
+   register that was not confirmed.
+8. **Never escalate.** Access problems are explained; the tool does not run `sudo`, install files,
+   or modify system state.
+
+If something does go wrong, restore the backup from the Backups screen. If the mouse is
+unresponsive, reconnect it; the configuration persists. The vendor application or a firmware
+reflash is the last resort.
+
+## Requirements
+
+- Linux with `hidraw` (any current kernel) and `udev`.
+- A Rust toolchain, 1.82 or newer, to build.
+- For the GUI: an X11 or Wayland session with an OpenGL-capable driver (the `glow` renderer).
+- Read/write access to the mouse's **vendor interface** (`/dev/hidrawN`), normally granted by a
+  udev rule.
+
+No kernel module, `libusb` package, or root session is required at runtime.
+
+## Build from source
 
 ```sh
+git clone https://github.com/sekhnat/redragon-mouse-linux.git
+cd redragon-mouse-linux
 cargo build --release
 ```
 
-Requirements: a Rust toolchain (1.82 or newer), the usual X11/Wayland development packages for
-`winit`, and an OpenGL-capable driver (the `glow` renderer is used). The release build is a single
-binary, `target/release/redragon-gui`.
+The result is a single binary at `target/release/redragon-gui`.
 
 ## Install
 
@@ -53,106 +143,179 @@ sudo install -Dm644 assets/redragon-gui.svg /usr/local/share/icons/hicolor/scala
 sudo udevadm control --reload-rules && sudo udevadm trigger
 ```
 
-Reconnect the mouse after installing the udev rule, then run `redragon-gui`.
-
-The rule only grants access to the vendor interface of `04d9:fc5c`; add another rule (or edit the
-existing one) for a different model. The application prints the exact rule it needs — including
-the node path, its mode, and its owner — when access is missing.
-
-If `TAG+="uaccess"` does not produce an ACL on the hidraw node on your system (verify with
-`getfacl /dev/hidrawN`), add `GROUP="users"` to the rule (and make sure your user is in that
-group), or grant a session ACL with `sudo setfacl -m u:$USER:rw /dev/hidrawN`. This host needed
-the group grant; see the hardware checkpoint.
-
-## Use
+Reconnect the mouse, then check:
 
 ```sh
-redragon-gui                    # graphical interface
-redragon-gui --list-devices     # list HID interfaces and mark supported ones
-redragon-gui --dump-state       # read and print the current settings
-redragon-gui --show-descriptor  # print a model descriptor
-redragon-gui --report-descriptor  # dump and parse the interface's HID report descriptor
-redragon-gui --dump-raw         # print the raw register windows read from the device
-redragon-gui --simulate holtek-04d9-fc5c   # explore the UI without hardware
+redragon-gui --list-devices
 ```
 
-Exit codes: `0` success, `1` error, `2` no supported device, `3` the configuration interface
-cannot be opened (the access guidance is printed).
+The shipped rule uses `TAG+="uaccess"`. On systems where logind does not apply the ACL to the
+hidraw node — verify with `getfacl /dev/hidrawN` — add `GROUP="users"` to the rule (your user must
+be in that group), or grant a session ACL:
 
-The interface has these sections:
+```sh
+sudo setfacl -m u:$USER:rw /dev/hidrawN
+```
 
-| Section | What it does |
+The application prints the exact rule it needs, including the node, its mode and its owner.
+
+## Usage
+
+```sh
+redragon-gui                              # graphical interface
+redragon-gui --list-devices               # HID interfaces, supported/unsupported
+redragon-gui --dump-state                 # decoded settings
+redragon-gui --dump-raw                   # raw register windows (diagnostics)
+redragon-gui --report-descriptor          # HID report descriptor, collections, report sizes
+redragon-gui --show-descriptor [MODEL]    # print a model descriptor
+redragon-gui --simulate holtek-04d9-fc5c  # full interface without hardware
+```
+
+| Exit code | Meaning |
 |---|---|
-| Device | Model, IDs, node, descriptor provenance, capabilities, access guidance, last apply report |
-| Pointer | Five DPI stages (enable, value, X/Y link where supported, active stage), polling rate, global pointer settings |
-| Lighting | Effect, colour (RGB/HSV/hex), brightness, effect speed, zones where declared |
-| Profiles | Five onboard slots: activate, copy, reset, import/export the vendor `.prof` layout |
-| Buttons | Per-button action, key, macro slot, multi-key combos, primary-click guard |
-| Macros | Library, ordered actions with delays, burst fire, portable macro files |
-| Backups | Restore a recorded register set through the same verified path |
-| Diagnostics | Log path, descriptor load problems, access guidance, apply report |
+| `0` | Success |
+| `1` | Error (arguments, descriptor, I/O) |
+| `2` | No supported device found |
+| `3` | The configuration interface cannot be opened (access guidance printed) |
 
-## How a change reaches the mouse
+The interface has eight sections:
 
-1. On connect, every register window declared by the descriptor is read twice; the two reads must
-   match and must not be all-zero/all-`0xFF` filler.
-2. Edits stay in a draft. The Apply button is enabled only when at least one encoded register
-   differs from the baseline and the draft validates against the descriptor.
-3. Apply shows the exact change set (register, before, after) and asks for confirmation. An
-   unverified descriptor adds a risk acknowledgement.
-4. The targeted registers are re-read; if they changed since the baseline read, the apply is
-   refused until you explicitly choose "write anyway".
-5. A timestamped backup of the pre-apply values is written **before** the first frame.
-6. Frames are written per profile with begin/commit framing and the documented pacing. A failure
-   triggers a rollback attempt of the registers already written.
-7. Every written register is read back and compared. Mismatches are reported as "not confirmed";
-   they are never presented as success.
+| Section | Contents |
+|---|---|
+| **Device** | Model, IDs, node, descriptor provenance, capabilities, access guidance, last apply report |
+| **Pointer** | Five DPI stages (enable, value, X/Y link where supported, active stage), polling rate, global pointer settings where declared |
+| **Lighting** | Effect, colour (RGB/HSV/hex), brightness, effect speed, zones where declared |
+| **Profiles** | Five onboard slots: activate, copy, reset; vendor `.prof` import/export |
+| **Buttons** | Per-button action, key, macro slot and combo editor; primary-click guard |
+| **Macros** | Library, ordered actions with delays, burst fire, portable JSON files |
+| **Backups** | Restore a recorded register set through the verified path |
+| **Diagnostics** | Log path, descriptor load problems, access guidance, apply report |
 
-## Files
+Pending edits are kept in a draft, survive a disconnect, and reach the mouse only when you apply.
 
-- Backups: `$XDG_STATE_HOME/redragon-gui/backups/<timestamp>_<vid>_<pid>_p<profile>.json`
-  (defaults to `~/.local/state/redragon-gui/backups`). Never pruned automatically.
-- Logs: `$XDG_STATE_HOME/redragon-gui/logs/session-*.log`.
-- Macro names: `$XDG_CONFIG_HOME/redragon-gui/macro-names.json` (the device stores records, not
-  names).
-- Exported profiles use the vendor `.prof` field names; exported macros are JSON documents.
+## Screenshots
 
-## Recovery
+| Profiles | Macros |
+|---|---|
+| ![Profiles](docs/screenshots/profiles.png) | ![Macros](docs/screenshots/macros.png) |
 
-A wrong write can leave the mouse in a state that is awkward to use (for example a reassigned
-primary click). Before writing anything, the tool stores the previous register values; restore
-that backup from the Backups screen. If the mouse is unresponsive, reconnect it — the mouse keeps
-its configuration across power cycles — and use the vendor application or a firmware reflash as
-the last resort. The primary-click reassignment is guarded by a confirmation that spells this out.
+Screenshots are from simulation mode, so no hardware identifiers or user paths are shown.
 
 ## Model descriptors
 
-Adding a model means adding a TOML descriptor and a registry entry — no recompilation. A descriptor
-declares the register windows used for reading, the write regions for each feature, the encoding
-tables (DPI codes, keycodes, LED modes/zones, button inventory), and its provenance. See
-`models/holtek-04d9-fc5c.toml` for a commented example.
+A descriptor is declarative data: vendor collection, feature-report table, read windows, write
+regions, per-feature encodings, tables (DPI codes, keycodes, LED modes/zones, buttons), limits,
+provenance, and a `verified` flag. See
+[`models/holtek-04d9-fc5c.toml`](models/holtek-04d9-fc5c.toml) for a commented example and
+[`models/00-registry.toml`](models/00-registry.toml) for the registry.
 
-Descriptors are validated at load: missing sections, overlapping write regions, addresses outside
-the frame capacity, and tables that cannot express a declared value are rejected. One broken file
-does not prevent the others from loading; the problem is shown in Diagnostics.
+```toml
+[[frames]]
+id = 2
+len = 16
 
-## Tests
+[windows.profile_page]
+report = 3
+count = 5
+len = 32
+addrs = [0x0042, 0x0102, 0x01b2, 0x0262, 0x0312]
+```
+
+Descriptors are loaded from the data directory (`/usr/local/share/redragon-gui/models/` or
+`models/` in a checkout), validated semantically at load, and never compiled in. A malformed file
+is reported in Diagnostics and skipped without affecting other models.
+
+## Project layout
+
+```
+src/
+  transport/   feature-report frames, hidraw ioctl backend, in-memory simulator
+  device/      sysfs enumeration, report-descriptor parser, access diagnostics
+  models/      descriptor schema, registry, semantic validation, test fixture
+  settings/    register image, typed views, diff, transaction engine, backups, file formats
+  ui/          egui shell and one module per section
+models/        registry + per-model TOML descriptors
+assets/        udev rule, desktop entry, AppStream metadata, icon
+tests/         simulation, CLI contract, ignored hardware round-trip
+docs/          reverse-engineering report and hardware checkpoint
+openspec/      change proposal, specs, design and task record
+```
+
+The `transport` and `settings` layers are UI-free; the UI is a rendering layer over a baseline and
+a draft. `unsafe` is limited to the `libc` seams for hidraw ioctls and locking.
+
+## Testing
 
 ```sh
-cargo test
+cargo test                         # unit, simulation and CLI tests (no hardware)
 cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-The suite covers frame golden vectors, report-descriptor parsing, registry resolution (including
-version-range conflicts and malformed files), descriptor validation, state round-trips, the
-transaction engine (stale refusal, verification mismatch, mid-transaction rollback, backup replay),
-profile and macro file round-trips, hotplug events, and a headless render of every screen.
+The default suite covers frame vectors, report-descriptor parsing, registry resolution, descriptor
+validation, state round-trips, transactional apply (stale refusal, verification mismatch,
+mid-transaction rollback), backup replay, profile and macro files, hotplug events, and a headless
+render of every screen.
+
+One optional test talks to the physical mouse and is **ignored by default**:
+
+```sh
+REDRAGON_GUI_ALLOW_WRITE=1 cargo test --test hardware -- --ignored --nocapture
+```
+
+It changes one LED brightness value on a non-active profile, verifies it by read-back, restores the
+backup, and verifies the restore. It refuses to run without the environment variable.
+
+## Known limitations
+
+- **DPI and LED-mode tables are incomplete for `04d9:fc5c`.** The device's current codes are shown
+  as unknown and preserved byte-for-byte; selecting a table value writes a code that has not been
+  confirmed on this PID. The LED mode encoding is two bytes and only partly modelled.
+- **Button remapping is unavailable on this model.** The documented keymap addresses collide with
+  the DPI pages, so no keymap registers are declared; the Buttons screen explains this.
+- **Global pointer settings are unavailable on this model** (angle snap, lift-off distance, scroll
+  speed/page, acceleration, double-click), because their registers are not pinned.
+- **Burst fire is unavailable on this model** (no burst register is declared).
+- **Macro writing is unverified.** The record encoding is a documented hypothesis; only the
+  brightness write has been exercised on hardware.
+- **`.prof` interoperability is approximate.** The tool round-trips its own exports and reads the
+  documented field names, but vendor action codes and some fields differ.
+- **Other models need captures.** Adding one is data-only, but the descriptor must be written from
+  evidence.
+- **The `04d9:fc5c` descriptor stays unverified**, so every write requires the risk
+  acknowledgement.
+- **Writes are GUI-only.** There is no headless `--set` command yet.
+- **Packaging and project metadata are unfinished** (no AUR/Flatpak/CI; the AppStream URL is a
+  placeholder).
+- **egui's accessibility is weaker than GTK's.** Keyboard navigation and focus are implemented;
+  screen-reader parity is not.
+- **The original reverse-engineering report predates the hardware checkpoint.** Where it says
+  `0xFF00` or "report 4 = 1024 B", the checkpoint and descriptor reflect the hardware:
+  `0xFFA0`, report 2/3/4 = 16/64/256 B, and 1024 B as report 5.
+
+## Documentation
+
+- [`docs/hardware-checkpoint.md`](docs/hardware-checkpoint.md) — report descriptor, raw register
+  dumps, read/write sequences, detach/reconnect, verification decision.
+- [`docs/redragon-gaming-mouse-re.md`](docs/redragon-gaming-mouse-re.md) — reverse-engineering report
+  for the vendor application and protocol. The proprietary Windows package it analyses is **not**
+  included in this repository.
+- [`openspec/changes/add-redragon-mouse-gui/`](openspec/changes/add-redragon-mouse-gui/) — proposal,
+  capability specs, design decisions and task record for the implementation.
+
+## Contributing
+
+Captures are the most valuable contribution: a descriptor or a confirmed table entry with its
+provenance. Before opening a pull request, run the commands under [Testing](#testing), keep
+descriptors evidence-based (no interpolated values), and mark anything not confirmed on hardware as
+`verified = false`.
 
 ## License and provenance
 
-Dual-licensed under MIT or Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`).
+Licensed under either of [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your option.
 
-The protocol facts in the descriptors come from the repository's own reverse-engineering report
-and from public HID documentation. No tables or source code from `mouse_m908` (GPL-3.0) were
-copied; the descriptor schema records provenance per model so that distinction stays visible.
+The protocol facts in the descriptors and documentation come from this project's own
+reverse-engineering report and from read-only observation of the hardware; HID usage IDs follow the
+USB HID specification. No code or captured tables from `mouse_m908` (GPL-3.0) or other projects were
+copied. The vendored Windows application and its Qt/HID libraries are proprietary and are not
+distributed with this repository.
